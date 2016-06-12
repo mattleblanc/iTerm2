@@ -333,11 +333,10 @@ static NSString* TERMINAL_ARRANGEMENT_HIDING_TOOLBELT_SHOULD_RESIZE_WINDOW = @"H
             return NSBorderlessWindowMask;
 
         default:
-            return (NSTitledWindowMask |
-                    NSClosableWindowMask |
-                    NSMiniaturizableWindowMask |
-                    NSResizableWindowMask |
-                    NSTexturedBackgroundWindowMask);
+        return (NSClosableWindowMask |
+                NSMiniaturizableWindowMask |
+                NSResizableWindowMask |
+                NSTexturedBackgroundWindowMask);
     }
 }
 
@@ -2745,7 +2744,7 @@ static NSString* TERMINAL_ARRANGEMENT_HIDING_TOOLBELT_SHOULD_RESIZE_WINDOW = @"H
     if ([iTermAdvancedSettingsModel disableWindowSizeSnap]) {
         snapWidth = snapHeight = NO;
     }
-    
+
     // Compute proposed tab size (window minus decorations).
     NSSize decorationSize = [self windowDecorationSize];
     NSSize tabSize = NSMakeSize(proposedFrameSize.width - decorationSize.width,
@@ -5876,7 +5875,7 @@ static NSString* TERMINAL_ARRANGEMENT_HIDING_TOOLBELT_SHOULD_RESIZE_WINDOW = @"H
 
 
     [_contentView.tabView cycleFlagsChanged:[theEvent modifierFlags]];
-    
+
     NSUInteger modifierFlags = [theEvent modifierFlags];
     if (!(modifierFlags & NSCommandKeyMask) &&
         [[[self currentSession] textview] isFindingCursor]) {
