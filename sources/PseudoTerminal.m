@@ -337,11 +337,10 @@ static NSString* TERMINAL_ARRANGEMENT_HIDING_TOOLBELT_SHOULD_RESIZE_WINDOW = @"H
             return NSBorderlessWindowMask;
 
         default:
-            return (NSTitledWindowMask |
-                    NSClosableWindowMask |
-                    NSMiniaturizableWindowMask |
-                    NSResizableWindowMask |
-                    NSTexturedBackgroundWindowMask);
+        return (NSClosableWindowMask |
+                NSMiniaturizableWindowMask |
+                NSResizableWindowMask |
+                NSTexturedBackgroundWindowMask);
     }
 }
 
