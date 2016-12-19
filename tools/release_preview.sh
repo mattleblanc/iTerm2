@@ -31,6 +31,12 @@ function SparkleSign {
 # Fifth arg is a prefix for sparkle files.
 # Sixth arg is extra args for codesign
 function Build {
+  pushd build/$BUILDTYPE/iTerm2.app/Contents/MacOS
+  echo Making link
+  ln -s iTerm2 iTerm
+  ls -l
+  popd
+
   BUILDTYPE=$1
   NAME=$(echo $VERSION | sed -e "s/\\./_/g")$2
   SUMMARY=$3
@@ -49,6 +55,7 @@ function Build {
   # since Sparkle won't accept a name change.
   rm -rf iTerm.app
   mv iTerm2.app iTerm.app
+
   zip -ry iTerm2-${NAME}.zip iTerm.app
  
   # Update the list of changes
@@ -81,15 +88,21 @@ ORIG_DIR=`pwd`
 echo "Build deployment release"
 make clean
 make preview
-Build Deployment "-preview" "OS 10.8+" "This is the recommended beta build for most users. It contains a bunch of bug fixes, including fixes for some crashers." "" "--deep"
+
+BUILDTYPE=Deployment
+
+Build $BUILDTYPE "" "OS 10.8+" "This is the recommended beta build for most users. It contains a bunch of bug fixes, including fixes for some crashers." "" "--deep"
 
 #set -x
+echo Fix version.txt. Should look like: +3.0.%(extra)s
+sleep 2
+vi version.txt
 
-git tag v${VERSION}-preview
-git commit -am ${VERSION}-preview
+git tag v${VERSION}
+git commit -am ${VERSION}
 git push origin master
 git push --tags
 cd $SVNDIR
-git commit -am v${VERSION}-preview
+git commit -am v${VERSION}
 git push origin master
 

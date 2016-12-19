@@ -135,14 +135,29 @@
 #define KEY_ACTION_INCREASE_HEIGHT 50
 #define KEY_ACTION_DECREASE_WIDTH 51
 #define KEY_ACTION_INCREASE_WIDTH 52
+#define KEY_ACTION_SWAP_PANE_LEFT 53
+#define KEY_ACTION_SWAP_PANE_RIGHT 54
+#define KEY_ACTION_SWAP_PANE_ABOVE 55
+#define KEY_ACTION_SWAP_PANE_BELOW 56
+#define KEY_FIND_AGAIN_DOWN 57
+#define KEY_FIND_AGAIN_UP 58
 
+@interface iTermKeyBindingMgr : NSObject
 
-@interface iTermKeyBindingMgr : NSObject {
-}
++ (NSArray<NSString *> *)sortedTouchBarKeysInDictionary:(NSDictionary<NSString *, NSDictionary *> *)dict;
 
 // Given a key combination of the form 0xKeycode-0xModifiers, return a human-
 // readable representation (e.g., ^X)
 + (NSString *)formatKeyCombination:(NSString *)theKeyCombination;
+
+// Formats the key combination using the current keyboard's mapping from
+// keycode to character. keyCode must not be 0, or it will fall back to the
+// character embedded in the key combination.
++ (NSString *)formatKeyCombination:(NSString *)theKeyCombination keyCode:(NSUInteger)keyCode;
+
+// Given a keycode and a modifier return 0xKeycode-0xModifiers
++ (NSString *)identifierForCharacterIgnoringModifiers:(unichar)characterIgnoringModifiers
+                                            modifiers:(NSEventModifierFlags)keyMods;
 
 // Given a dictionary with keys Action->int, Text->string, return a human-readable
 // description (e.g., "Send text: foo"). The action comes from the KEY_ACTION_xxx
@@ -160,9 +175,14 @@
 // Remove an item from the bookmark's keymappings by index.
 + (void)removeMappingAtIndex:(int)rowIndex inBookmark:(NSMutableDictionary*)bookmark;
 
++ (NSDictionary *)dictionaryByRemovingTouchBarItem:(NSString *)key fromDictionary:(NSDictionary *)dictionary;
+
 // Return a dictionary that is a copy of dict, but without the keymapping at the
 // requested index.
 + (NSMutableDictionary*)removeMappingAtIndex:(int)rowIndex inDictionary:(NSDictionary*)dict;
+
+// Removes a touichbar item form a profile. Does not sync it back to user defaults.
++ (void)removeTouchBarItemWithKey:(NSString *)key inMutableProfile:(MutableProfile *)profile;
 
 // load an xml plist with the given filename, and return it in dictionary
 // format.
@@ -184,6 +204,7 @@
 
 + (NSArray *)sortedGlobalKeyCombinations;
 + (NSArray *)sortedKeyCombinationsForProfile:(Profile *)profile;
++ (NSArray *)sortedTouchBarItemsForProfile:(Profile *)profile;
 
 // This function has two modes:
 // If newMapping is false, replace a mapping at the specified index. The index
@@ -212,6 +233,21 @@
                 createNew:(BOOL)newMapping
              inDictionary:(NSMutableDictionary*)km;
 
+// Change or add a touchbar item.
++ (void)setTouchBarItemWithKey:(NSString *)key
+                      toAction:(int)action
+                         value:(NSString *)value
+                         label:(NSString *)label
+                     inProfile:(MutableProfile *)profile;
+
++ (void)updateDictionary:(NSMutableDictionary *)dict
+         forTouchBarItem:(NSString *)key
+                  action:(int)action
+                   value:(NSString *)parameter
+                   label:(NSString *)label;
+
++ (void)removeTouchBarItem:(NSString *)key;
+
 // Return a shortcut (0xKeycode-0xModifier) by index from a bookmark.
 + (NSString*)shortcutAtIndex:(int)rowIndex forBookmark:(Profile*)bookmark;
 
@@ -227,6 +263,7 @@
 + (NSDictionary*)globalMappingAtIndex:(int)rowIndex;
 
 + (NSDictionary *)keyMappingsForProfile:(Profile *)profile;
++ (NSDictionary *)touchBarItemsForProfile:(Profile *)profile;
 
 // Return the number of key mappings in a bookmark.
 + (int)numberOfMappingsForBookmark:(Profile*)bmDict;
@@ -252,8 +289,14 @@
 // Returns the global keymap ("0xKeycode-0xModifiers"->{Action=int, [Text=str])
 + (NSDictionary*)globalKeyMap;
 
+// Returns the global touchbar map ("touchbar:uuid" -> (Action=int, [Text=str])
++ (NSDictionary *)globalTouchBarMap;
+
 // Replace the global keymap with a new dictionary.
 + (void)setGlobalKeyMap:(NSDictionary*)src;
+
+// Replace the global touchbar map with a new dictionary.
++ (void)setGlobalTouchBarMap:(NSDictionary*)src;
 
 // True if a keystring 0xKeycode-0xModifiers has any global mapping.
 + (BOOL)haveGlobalKeyMappingForKeyString:(NSString*)keyString;
@@ -266,6 +309,12 @@
 // it returns nil. If a bookmark is specified and changed, an autorelease copy of the modified
 // bookmark is returned.
 + (Profile*)removeMappingsReferencingGuid:(NSString*)guid fromBookmark:(Profile*)bookmark;
+
+
++ (int)actionForTouchBarItemBinding:(NSDictionary *)binding;
++ (NSString *)parameterForTouchBarItemBinding:(NSDictionary *)binding;
+
++ (NSString *)touchBarLabelForBinding:(NSDictionary *)binding;
 
 @end
 

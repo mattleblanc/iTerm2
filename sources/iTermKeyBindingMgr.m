@@ -74,28 +74,26 @@
 #import "ITAddressBookMgr.h"
 
 #import "DebugLogging.h"
+#import "iTermHotKeyController.h"
 #import "iTermKeyBindingMgr.h"
+#import "iTermModifierRemapper.h"
 #import "iTermPasteSpecialViewController.h"
 #import "iTermPreferences.h"
-#import "HotkeyWindowController.h"
+#import "NSArray+iTerm.h"
+#import "NSStringITerm.h"
 #import "PTYTextView.h"   // For selection movement units
 #import <Carbon/Carbon.h>
 
-static NSDictionary* globalKeyMap;
+static NSDictionary *globalKeyMap;
+static NSDictionary *globalTouchBarMap;
 static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
 
 @implementation iTermKeyBindingMgr
 
-+ (NSString *)formatKeyCombination:(NSString *)theKeyCombination
-{
-    unsigned int keyMods;
-    unsigned int keyCode;
-    NSString *aString;
-    NSMutableString *theKeyString;
-    keyCode = keyMods = 0;
-    sscanf([theKeyCombination UTF8String], "%x-%x", &keyCode, &keyMods);
++ (NSString *)stringForCharacter:(unsigned int)character isArrow:(BOOL *)isArrowPtr {
     BOOL isArrow = NO;
-    switch (keyCode) {
+    NSString *aString = nil;
+    switch (character) {
         case NSDownArrowFunctionKey:
             aString = @"↓";
             isArrow = YES;
@@ -150,7 +148,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
         case NSF18FunctionKey:
         case NSF19FunctionKey:
         case NSF20FunctionKey:
-            aString = [NSString stringWithFormat: @"F%d", (keyCode - NSF1FunctionKey + 1)];
+            aString = [NSString stringWithFormat: @"F%d", (character - NSF1FunctionKey + 1)];
             break;
         case NSHelpFunctionKey:
             aString = NSLocalizedStringFromTableInBundle(@"Help",
@@ -184,7 +182,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
         case '7':
         case '8':
         case '9':
-            aString = [NSString stringWithFormat: @"%d", (keyCode - '0')];
+            aString = [NSString stringWithFormat: @"%d", (character - '0')];
             break;
         case '=':
             aString = @"=";
@@ -222,67 +220,134 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
             break;
 
         default:
-            if (keyCode >= '!' && keyCode <= '~') {
-                aString = [NSString stringWithFormat:@"%c", keyCode];
+            if (character > ' ' && (character < 0xe800 || character > 0xfdff) && character < 0xffff) {
+                aString = [NSString stringWithFormat:@"%C", (unichar)character];
             } else {
-                switch (keyCode) {
+                switch (character) {
                     case ' ':
                         aString = @"Space";
                         break;
 
                     case '\r':
-                        aString = @"↩";
+                        aString = @"Return ↩";
                         break;
 
                     case 27:
-                        aString = @"⎋";
+                        aString = @"Esc ⎋";
                         break;
 
                     case '\t':
-                        aString = @"↦";
+                        aString = @"Tab ↦";
                         break;
 
                     case 0x19:
                         // back-tab
-                        aString = @"↤";
+                        aString = @"Tab ↤";
                         break;
 
                     default:
-                        aString = [NSString stringWithFormat: @"%@ 0x%x",
-                                   NSLocalizedStringFromTableInBundle(@"Hex Code",
-                                                                      @"iTerm",
-                                                                      [NSBundle bundleForClass: [self class]],
-                                                                      @"Key Names"),
-                                   keyCode];
+                        aString = [NSString stringWithFormat: @"Hex Code 0x%x", character];
                         break;
                 }
             }
             break;
     }
+    if (isArrowPtr) {
+        *isArrowPtr = isArrow;
+    }
+    return aString;
+}
 
-    theKeyString = [[NSMutableString alloc] initWithString: @""];
-    if (keyMods & NSControlKeyMask) {
-        [theKeyString appendString: @"^"];
++ (NSString *)stringForKeyCode:(CGKeyCode)virtualKeyCode
+                     character:(unichar)character
+                       isArrow:(BOOL *)isArrow {
+    TISInputSourceRef inputSource = NULL;
+    NSString *result = nil;
+
+    if (virtualKeyCode != 0) {
+        inputSource = TISCopyCurrentKeyboardInputSource();
+        if (inputSource == NULL) {
+            goto exit;
+        }
+
+        CFDataRef keyLayoutData = TISGetInputSourceProperty(inputSource,
+                                                            kTISPropertyUnicodeKeyLayoutData);
+        if (keyLayoutData == NULL) {
+            goto exit;
+        }
+
+        const UCKeyboardLayout *keyLayoutPtr = (const UCKeyboardLayout *)CFDataGetBytePtr(keyLayoutData);
+        if (keyLayoutPtr == NULL) {
+            goto exit;
+        }
+
+        UInt32 deadKeyState = 0;
+        UniChar unicodeString[4];
+        UniCharCount actualStringLength;
+
+        OSStatus status = UCKeyTranslate(keyLayoutPtr,
+                                         virtualKeyCode,
+                                         kUCKeyActionDisplay,
+                                         0,
+                                         LMGetKbdType(),
+                                         kUCKeyTranslateNoDeadKeysBit,
+                                         &deadKeyState,
+                                         sizeof(unicodeString) / sizeof(*unicodeString),
+                                         &actualStringLength,
+                                         unicodeString);
+        if (status != noErr) {
+            goto exit;
+        }
+
+        if (actualStringLength == 0) {
+            goto exit;
+        }
+
+        if (unicodeString[0] <= ' ' || unicodeString[0] == 127) {
+            goto exit;
+        }
+
+        result = [NSString stringWithCharacters:unicodeString length:actualStringLength];
     }
-    if (keyMods & NSAlternateKeyMask) {
-        [theKeyString appendString: @"⌥"];
+
+exit:
+    if (inputSource != NULL) {
+        CFRelease(inputSource);
     }
-    if (keyMods & NSShiftKeyMask) {
-        [theKeyString appendString: @"⇧"];
+    if (result == nil) {
+        result = [self stringForCharacter:character isArrow:isArrow];
     }
-    if (keyMods & NSCommandKeyMask) {
-        [theKeyString appendString: @"⌘"];
-    }
+    return result;
+}
+
++ (NSString *)formatKeyCombination:(NSString *)theKeyCombination {
+    return [self formatKeyCombination:theKeyCombination keyCode:0];
+}
+
++ (NSString *)formatKeyCombination:(NSString *)theKeyCombination keyCode:(NSUInteger)virtualKeyCode {
+    unsigned int keyMods = 0;
+    unsigned int keyCode = 0;
+
+    sscanf([theKeyCombination UTF8String], "%x-%x", &keyCode, &keyMods);
+
+    BOOL isArrow = NO;
+    NSString *charactersAsString = [self stringForKeyCode:virtualKeyCode character:keyCode isArrow:&isArrow];
+
+    NSMutableString *result = [[[NSString stringForModifiersWithMask:keyMods] mutableCopy] autorelease];
     if ((keyMods & NSNumericPadKeyMask) && !isArrow) {
-        [theKeyString appendString: @"num-"];
+        [result appendString: @"num-"];
     }
-    [theKeyString appendString: aString];
-    return [theKeyString autorelease];
+    [result appendString:charactersAsString];
+    return result;
 }
 
 + (NSString*)_bookmarkNameForGuid:(NSString*)guid
 {
     return [[[ProfileModel sharedInstance] bookmarkWithGuid:guid] objectForKey:KEY_NAME];
+}
+
++ (NSString *)touchBarLabelForBinding:(NSDictionary *)binding {
+    return binding[@"Label"] ?: @"?";
 }
 
 + (NSString *)formatAction:(NSDictionary *)keyInfo
@@ -393,7 +458,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
             actionString = @"Unsupported Command";
             break;
         case KEY_ACTION_IR_BACKWARD:
-            actionString = @"Backward in Time";
+            actionString = @"Start Instant Replay";
             break;
         case KEY_ACTION_SELECT_PANE_LEFT:
             actionString = @"Select Split Pane on Left";
@@ -417,13 +482,19 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
             actionString = @"Toggle Fullscreen";
             break;
         case KEY_ACTION_TOGGLE_HOTKEY_WINDOW_PINNING:
-            actionString = @"Toggle Hotkey Hides When Focus Lost";
+            actionString = @"Toggle Pin Hotkey Window";
             break;
         case KEY_ACTION_UNDO:
             actionString = @"Undo";
             break;
         case KEY_ACTION_FIND_REGEX:
             actionString = [NSString stringWithFormat:@"Find Regex “%@”", auxText];
+            break;
+        case KEY_FIND_AGAIN_DOWN:
+            actionString = @"Find Again Down";
+            break;
+        case KEY_FIND_AGAIN_UP:
+            actionString = @"Find Again Up";
             break;
         case KEY_ACTION_PASTE_SPECIAL_FROM_SELECTION: {
             NSString *pasteDetails =
@@ -465,7 +536,6 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
         case KEY_ACTION_DECREASE_HEIGHT:
             actionString = @"Decrease Height";
             break;
-
         case KEY_ACTION_INCREASE_HEIGHT:
             actionString = @"Increase Height";
             break;
@@ -473,9 +543,21 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
         case KEY_ACTION_DECREASE_WIDTH:
             actionString = @"Decrease Width";
             break;
-            
         case KEY_ACTION_INCREASE_WIDTH:
             actionString = @"Increase Width";
+            break;
+
+        case KEY_ACTION_SWAP_PANE_LEFT:
+            actionString = @"Swap With Split Pane on Left";
+            break;
+        case KEY_ACTION_SWAP_PANE_RIGHT:
+            actionString = @"Swap With Split Pane on Right";
+            break;
+        case KEY_ACTION_SWAP_PANE_ABOVE:
+            actionString = @"Swap With Split Pane Above";
+            break;
+        case KEY_ACTION_SWAP_PANE_BELOW:
+            actionString = @"Swap With Split Pane Below";
             break;
 
         default:
@@ -506,31 +588,38 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return [[self globalKeyMap] objectForKey:keyString] != nil;
 }
 
-+ (BOOL)haveKeyMappingForKeyString:(NSString*)keyString inBookmark:(Profile*)bookmark
-{
++ (BOOL)haveKeyMappingForKeyString:(NSString*)keyString inBookmark:(Profile*)bookmark {
     NSDictionary *dict = [bookmark objectForKey:KEY_KEYBOARD_MAP];
     return [dict objectForKey:keyString] != nil;
 }
 
-+ (int)localActionForKeyCode:(unichar)keyCode
-                   modifiers:(unsigned int) keyMods
-                        text:(NSString **) text
-                 keyMappings:(NSDictionary *)keyMappings
-{
-    NSString *keyString;
-    NSDictionary *theKeyMapping;
-    int retCode = -1;
-    unsigned int theModifiers;
-
-    // turn off all the other modifier bits we don't care about
-    theModifiers = keyMods & (NSAlternateKeyMask | NSControlKeyMask | NSShiftKeyMask | NSCommandKeyMask | NSNumericPadKeyMask);
-
++ (NSEventModifierFlags)modifiersForKeyCode:(int)keyCode modifiers:(NSEventModifierFlags)keyMods {
+    NSEventModifierFlags theModifiers = keyMods & (NSAlternateKeyMask | NSControlKeyMask | NSShiftKeyMask | NSCommandKeyMask | NSNumericPadKeyMask);
+    
     // on some keyboards, arrow keys have NSNumericPadKeyMask bit set; manually set it for keyboards that don't
     if (keyCode >= NSUpArrowFunctionKey && keyCode <= NSRightArrowFunctionKey) {
         theModifiers |= NSNumericPadKeyMask;
     }
+    return theModifiers;
+}
 
-    keyString = [NSString stringWithFormat: @"0x%x-0x%x", keyCode, theModifiers];
++ (NSString *)identifierForCharacterIgnoringModifiers:(unichar)characterIgnoringModifiers
+                                            modifiers:(NSEventModifierFlags)keyMods {
+    // turn off all the other modifier bits we don't care about
+    unsigned int theModifiers = [self modifiersForKeyCode:characterIgnoringModifiers modifiers:keyMods];
+    return [NSString stringWithFormat: @"0x%x-0x%x", characterIgnoringModifiers, theModifiers];
+}
+
++ (int)localActionForKeyCode:(unichar)keyCode
+                   modifiers:(unsigned int)keyMods
+                        text:(NSString **)text
+                 keyMappings:(NSDictionary *)keyMappings
+{
+    NSString *keyString = [self identifierForCharacterIgnoringModifiers:keyCode modifiers:keyMods];
+    
+    NSDictionary *theKeyMapping;
+    int retCode = -1;
+
     theKeyMapping = [keyMappings objectForKey: keyString];
     if (theKeyMapping == nil) {
         if (text) {
@@ -547,8 +636,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return (retCode);
 }
 
-+ (void)_loadGlobalKeyMap
-{
++ (void)_loadGlobalKeyMap {
     globalKeyMap = [[NSUserDefaults standardUserDefaults] objectForKey:@"GlobalKeyMap"];
     if (!globalKeyMap) {
         NSString* plistFile = [[NSBundle bundleForClass: [self class]] pathForResource:@"DefaultGlobalKeyMap" ofType:@"plist"];
@@ -557,19 +645,39 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     [globalKeyMap retain];
 }
 
-+ (NSDictionary*)globalKeyMap
-{
++ (void)loadGlobalTouchBarMap {
+    globalTouchBarMap = [[NSUserDefaults standardUserDefaults] objectForKey:@"GlobalTouchBarMap"];
+    if (!globalTouchBarMap) {
+        NSString *plistFile = [[NSBundle bundleForClass: [self class]] pathForResource:@"DefaultGlobalTouchBarMap" ofType:@"plist"];
+        globalTouchBarMap = [NSDictionary dictionaryWithContentsOfFile:plistFile];
+    }
+    [globalTouchBarMap retain];
+}
+
++ (NSDictionary*)globalKeyMap {
     if (!globalKeyMap) {
         [iTermKeyBindingMgr _loadGlobalKeyMap];
     }
     return globalKeyMap;
 }
 
-+ (void)setGlobalKeyMap:(NSDictionary*)src
-{
-    [globalKeyMap release];
++ (NSDictionary *)globalTouchBarMap {
+    if (!globalTouchBarMap) {
+        [iTermKeyBindingMgr loadGlobalTouchBarMap];
+    }
+    return globalTouchBarMap;
+}
+
++ (void)setGlobalKeyMap:(NSDictionary *)src {
+    [globalKeyMap autorelease];
     globalKeyMap = [src copy];
     [[NSUserDefaults standardUserDefaults] setObject:globalKeyMap forKey:@"GlobalKeyMap"];
+}
+
++ (void)setGlobalTouchBarMap:(NSDictionary *)src {
+    [globalTouchBarMap autorelease];
+    globalTouchBarMap = [src copy];
+    [[NSUserDefaults standardUserDefaults] setObject:globalTouchBarMap forKey:@"GlobalTouchBarMap"];
 }
 
 + (int)actionForKeyCode:(unichar)keyCode
@@ -593,8 +701,15 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return keyBindingAction;
 }
 
-+ (NSMutableDictionary*)removeMappingAtIndex:(int)rowIndex inDictionary:(NSDictionary*)dict
-{
++ (int)actionForTouchBarItemBinding:(NSDictionary *)binding {
+    return [binding[@"Action"] intValue];
+}
+
++ (NSString *)parameterForTouchBarItemBinding:(NSDictionary *)binding {
+    return binding[@"Text"];
+}
+
++ (NSMutableDictionary*)removeMappingAtIndex:(int)rowIndex inDictionary:(NSDictionary*)dict {
     NSMutableDictionary* km = [NSMutableDictionary dictionaryWithDictionary:dict];
     NSArray* allKeys = [[km allKeys] sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
     if (rowIndex >= 0 && rowIndex < [allKeys count]) {
@@ -603,11 +718,29 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return km;
 }
 
-+ (void)removeMappingAtIndex:(int)rowIndex inBookmark:(NSMutableDictionary*)bookmark
-{
++ (void)removeTouchBarItem:(NSString *)key {
+    NSDictionary *dict = [self globalTouchBarMap];
+    dict = [self dictionaryByRemovingTouchBarItem:key fromDictionary:dict];
+    [self setGlobalTouchBarMap:dict];
+}
+
++ (NSDictionary *)dictionaryByRemovingTouchBarItem:(NSString *)key fromDictionary:(NSDictionary *)dictionary {
+    NSMutableDictionary *temp = [[dictionary mutableCopy] autorelease];
+    [temp removeObjectForKey:key];
+    return temp;
+}
+
+
++ (void)removeMappingAtIndex:(int)rowIndex inBookmark:(NSMutableDictionary*)bookmark {
     [bookmark setObject:[iTermKeyBindingMgr removeMappingAtIndex:rowIndex
                                                     inDictionary:[bookmark objectForKey:KEY_KEYBOARD_MAP]]
                  forKey:KEY_KEYBOARD_MAP];
+}
+
++ (void)removeTouchBarItemWithKey:(NSString *)key inMutableProfile:(MutableProfile *)profile {
+    NSDictionary *map = profile[KEY_TOUCHBAR_MAP];
+    map = [self dictionaryByRemovingTouchBarItem:key fromDictionary:map];
+    profile[KEY_TOUCHBAR_MAP] = map;
 }
 
 + (NSArray *)globalPresetNames {
@@ -631,18 +764,18 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return dict;
 }
 
-+ (void)setKeyMappingsToPreset:(NSString*)presetName inBookmark:(NSMutableDictionary*)bookmark
-{
++ (void)setKeyMappingsToPreset:(NSString*)presetName inBookmark:(NSMutableDictionary*)bookmark {
     NSMutableDictionary* km = [NSMutableDictionary dictionaryWithDictionary:[bookmark objectForKey:KEY_KEYBOARD_MAP]];
 
     [km removeAllObjects];
-    NSDictionary* presetsDict 
-        = [self readPresetKeyMappingsFromPlist:@"PresetKeyMappings"];
+    NSDictionary* presetsDict = [self readPresetKeyMappingsFromPlist:@"PresetKeyMappings"];
 
     NSDictionary* settings = [presetsDict objectForKey:presetName];
     [km setDictionary:settings];
 
     [bookmark setObject:km forKey:KEY_KEYBOARD_MAP];
+
+#warning Update touch bar
 }
 
 + (NSArray *)presetKeyMappingsNames {
@@ -691,13 +824,48 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
                    action:(int)actionIndex
                     value:(NSString*)valueToSend
                 createNew:(BOOL)newMapping
-               inBookmark:(NSMutableDictionary*)bookmark
-{
-
+               inBookmark:(NSMutableDictionary*)bookmark {
     NSMutableDictionary* km =
         [NSMutableDictionary dictionaryWithDictionary:[bookmark objectForKey:KEY_KEYBOARD_MAP]];
     [iTermKeyBindingMgr setMappingAtIndex:rowIndex forKey:keyString action:actionIndex value:valueToSend createNew:newMapping inDictionary:km];
     [bookmark setObject:km forKey:KEY_KEYBOARD_MAP];
+}
+
++ (void)setTouchBarItemWithKey:(NSString *)key
+                      toAction:(int)action
+                         value:(NSString *)value
+                         label:(NSString *)label
+                     inProfile:(MutableProfile *)profile {
+    NSMutableDictionary *map = [[profile[KEY_TOUCHBAR_MAP] mutableCopy] autorelease];
+    if (!map) {
+        map = [NSMutableDictionary dictionary];
+    }
+    [self updateDictionary:map forTouchBarItem:key action:action value:value label:label];
+    profile[KEY_TOUCHBAR_MAP] = map;
+}
+
++ (NSArray<NSString *> *)sortedTouchBarKeysInDictionary:(NSDictionary<NSString *, NSDictionary *> *)dict {
+    NSArray<NSString *> *keys = dict.allKeys;
+    keys = [keys sortedArrayUsingComparator:^NSComparisonResult(NSString *_Nonnull key1, NSString *_Nonnull key2) {
+        NSString *desc1 = [self formatAction:dict[key1]];
+        NSString *desc2 = [self formatAction:dict[key2]];
+        return [desc1 compare:desc2];
+    }];
+    return keys;
+}
+
++ (void)updateDictionary:(NSMutableDictionary *)dict
+         forTouchBarItem:(NSString *)key
+                  action:(int)action
+                   value:(NSString *)parameter
+                   label:(NSString *)label {
+    NSMutableDictionary *binding = [NSMutableDictionary dictionary];
+    binding[@"Action"] = @(action);
+    if (parameter) {
+        binding[@"Text"] = parameter;
+    }
+    binding[@"Label"] = label ?: @"?";
+    dict[key] = binding;
 }
 
 + (NSArray *)sortedGlobalKeyCombinations {
@@ -710,8 +878,12 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return [[km allKeys] sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
 }
 
-+ (NSString*)shortcutAtIndex:(int)rowIndex forBookmark:(Profile*)bookmark
-{
++ (NSArray *)sortedTouchBarItemsForProfile:(Profile *)profile {
+    NSDictionary *map =profile[KEY_TOUCHBAR_MAP];
+    return [self sortedTouchBarKeysInDictionary:map];
+}
+
++ (NSString*)shortcutAtIndex:(int)rowIndex forBookmark:(Profile *)bookmark {
     NSDictionary* km = [bookmark objectForKey:KEY_KEYBOARD_MAP];
     NSArray* allKeys = [[km allKeys] sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
     if (rowIndex >= 0 && rowIndex < [allKeys count]) {
@@ -734,6 +906,15 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
 
 + (NSDictionary *)keyMappingsForProfile:(Profile *)profile {
     return profile[KEY_KEYBOARD_MAP];
+}
+
++ (NSDictionary *)touchBarItemsForProfile:(Profile *)profile {
+    return profile[KEY_TOUCHBAR_MAP];
+}
+
++ (NSArray<NSString *> *)sortedKeysForKeyMappingsInProfile:(Profile *)profile {
+    NSDictionary *km = [profile objectForKey:KEY_KEYBOARD_MAP];
+    return [[km allKeys] sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
 }
 
 + (NSDictionary*)mappingAtIndex:(int)rowIndex forBookmark:(Profile*)bookmark
@@ -766,8 +947,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
 
 + (void)removeMappingWithCode:(unichar)keyCode
                     modifiers:(unsigned int)mods
-                   inBookmark:(NSMutableDictionary*)bookmark
-{
+                   inBookmark:(NSMutableDictionary*)bookmark {
     NSMutableDictionary* km = [NSMutableDictionary dictionaryWithDictionary:[bookmark objectForKey:KEY_KEYBOARD_MAP]];
     NSString* keyString = [NSString stringWithFormat:@"0x%x-0x%x", keyCode, mods];
     [km removeObjectForKey:keyString];
@@ -860,72 +1040,79 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
 
 + (NSInteger)_cgMaskForLeftCommandKey
 {
-    return [self _cgMaskForMod:[[HotkeyWindowController sharedInstance] leftCommandRemapping]];
+    return [self _cgMaskForMod:[[iTermModifierRemapper sharedInstance] leftCommandRemapping]];
 }
 
 + (NSInteger)_cgMaskForRightCommandKey
 {
-    return [self _cgMaskForMod:[[HotkeyWindowController sharedInstance] rightCommandRemapping]];
+    return [self _cgMaskForMod:[[iTermModifierRemapper sharedInstance] rightCommandRemapping]];
 }
 
 + (NSInteger)_nxMaskForLeftCommandKey
 {
-    return [self _nxMaskForLeftMod:[[HotkeyWindowController sharedInstance] leftCommandRemapping]];
+    return [self _nxMaskForLeftMod:[[iTermModifierRemapper sharedInstance] leftCommandRemapping]];
 }
 
 + (NSInteger)_nxMaskForRightCommandKey
 {
-    return [self _nxMaskForRightMod:[[HotkeyWindowController sharedInstance] rightCommandRemapping]];
+    return [self _nxMaskForRightMod:[[iTermModifierRemapper sharedInstance] rightCommandRemapping]];
 }
 
 + (NSInteger)_cgMaskForLeftAlternateKey
 {
-    return [self _cgMaskForMod:[[HotkeyWindowController sharedInstance] leftOptionRemapping]];
+    return [self _cgMaskForMod:[[iTermModifierRemapper sharedInstance] leftOptionRemapping]];
 }
 
 + (NSInteger)_cgMaskForRightAlternateKey
 {
-    return [self _cgMaskForMod:[[HotkeyWindowController sharedInstance] rightOptionRemapping]];
+    return [self _cgMaskForMod:[[iTermModifierRemapper sharedInstance] rightOptionRemapping]];
 }
 
 + (NSInteger)_nxMaskForLeftAlternateKey
 {
-    return [self _nxMaskForLeftMod:[[HotkeyWindowController sharedInstance] leftOptionRemapping]];
+    return [self _nxMaskForLeftMod:[[iTermModifierRemapper sharedInstance] leftOptionRemapping]];
 }
 
 + (NSInteger)_nxMaskForRightAlternateKey
 {
-    return [self _nxMaskForRightMod:[[HotkeyWindowController sharedInstance] rightOptionRemapping]];
+    return [self _nxMaskForRightMod:[[iTermModifierRemapper sharedInstance] rightOptionRemapping]];
 }
 
 + (NSInteger)_cgMaskForLeftControlKey
 {
-    return [self _cgMaskForMod:[[HotkeyWindowController sharedInstance] controlRemapping]];
+    return [self _cgMaskForMod:[[iTermModifierRemapper sharedInstance] controlRemapping]];
 }
 
 + (NSInteger)_cgMaskForRightControlKey
 {
-    return [self _cgMaskForMod:[[HotkeyWindowController sharedInstance] controlRemapping]];
+    return [self _cgMaskForMod:[[iTermModifierRemapper sharedInstance] controlRemapping]];
 }
 
 + (NSInteger)_nxMaskForLeftControlKey
 {
-    return [self _nxMaskForLeftMod:[[HotkeyWindowController sharedInstance] controlRemapping]];
+    return [self _nxMaskForLeftMod:[[iTermModifierRemapper sharedInstance] controlRemapping]];
 }
 
 + (NSInteger)_nxMaskForRightControlKey
 {
-    return [self _nxMaskForRightMod:[[HotkeyWindowController sharedInstance] controlRemapping]];
+    return [self _nxMaskForRightMod:[[iTermModifierRemapper sharedInstance] controlRemapping]];
 }
 
-+ (CGEventRef)remapModifiersInCGEvent:(CGEventRef)cgEvent
-{
++ (CGEventRef)remapModifiersInCGEvent:(CGEventRef)cgEvent {
     // This function copied from cmd-key happy. See copyright notice at top.
-    CGEventFlags flags = CGEventGetFlags(cgEvent);
-    const CGEventFlags origFlags = flags;
+    const CGEventFlags flags = CGEventGetFlags(cgEvent);
+    DLog(@"Performing remapping. On input CGEventFlags=%@", @(flags));
     CGEventFlags andMask = -1;
     CGEventFlags orMask = 0;
-    if (origFlags & kCGEventFlagMaskCommand) {
+
+    // flags contains both device-dependent flags and device-independent flags.
+    // The device-indepdendent flags are named kCGEventFlagMaskXXX or NX_xxxMASK
+    // The device-dependent flags are named NX_DEVICExxxKEYMASK
+    // Device-independent flags do not indicate leftness or rightness.
+    // Device-dependent flags do.
+    // Generally, you get both sets of flags. But this does not have to be the case if an event
+    // is synthesized, as seen in issue 5207 where Flycut does not set the device-dependent flags.
+    if ((flags & kCGEventFlagMaskCommand) && (flags & (NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK))) {
         andMask &= ~kCGEventFlagMaskCommand;
         if (flags & NX_DEVICELCMDKEYMASK) {
             andMask &= ~NX_DEVICELCMDKEYMASK;
@@ -938,7 +1125,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
             orMask |= [self _nxMaskForRightCommandKey];
         }
     }
-    if (origFlags & kCGEventFlagMaskAlternate) {
+    if ((flags & kCGEventFlagMaskAlternate) && (flags & (NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK))) {
         andMask &= ~kCGEventFlagMaskAlternate;
         if (flags & NX_DEVICELALTKEYMASK) {
             andMask &= ~NX_DEVICELALTKEYMASK;
@@ -951,7 +1138,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
             orMask |= [self _nxMaskForRightAlternateKey];
         }
     }
-    if (origFlags & kCGEventFlagMaskControl) {
+    if ((flags & kCGEventFlagMaskControl) && (flags & (NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK))) {
         andMask &= ~kCGEventFlagMaskControl;
         if (flags & NX_DEVICELCTLKEYMASK) {
             andMask &= ~NX_DEVICELCTLKEYMASK;
@@ -964,6 +1151,7 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
             orMask |= [self _nxMaskForRightControlKey];
         }
     }
+    DLog(@"On output CGEventFlags=%@", @((flags & andMask) | orMask));
 
     CGEventSetFlags(cgEvent, (flags & andMask) | orMask);
     return cgEvent;
@@ -974,37 +1162,49 @@ static NSString *const kFactoryDefaultsGlobalPreset = @"Factory Defaults";
     return [NSEvent eventWithCGEvent:[iTermKeyBindingMgr remapModifiersInCGEvent:[event CGEvent]]];
 }
 
-+ (Profile*)removeMappingsReferencingGuid:(NSString*)guid fromBookmark:(Profile*)bookmark
-{
-    if (bookmark) {
-        NSMutableDictionary* mutableBookmark = [NSMutableDictionary dictionaryWithDictionary:bookmark];
-        BOOL anyChange = NO;
-        BOOL change;
-        do {
-            change = NO;
-            for (int i = 0; i < [iTermKeyBindingMgr numberOfMappingsForBookmark:mutableBookmark]; i++) {
-                NSDictionary* keyMap = [iTermKeyBindingMgr mappingAtIndex:i forBookmark:mutableBookmark];
-                int action = [[keyMap objectForKey:@"Action"] intValue];
-                if (action == KEY_ACTION_NEW_TAB_WITH_PROFILE ||
-                    action == KEY_ACTION_NEW_WINDOW_WITH_PROFILE ||
-                    action == KEY_ACTION_SPLIT_HORIZONTALLY_WITH_PROFILE ||
-                    action == KEY_ACTION_SPLIT_VERTICALLY_WITH_PROFILE ||
-                    action == KEY_ACTION_SET_PROFILE) {
-                    NSString* referencedGuid = [keyMap objectForKey:@"Text"];
-                    if ([referencedGuid isEqualToString:guid]) {
-                        [iTermKeyBindingMgr removeMappingAtIndex:i inBookmark:mutableBookmark];
-                        change = YES;
-                        anyChange = YES;
-                        break;
-                    }
-                }
++ (NSString *)keyForMappingReferencingProfileWithGuid:(NSString *)guid inProfile:(Profile *)profile {
+    __block NSString *theKey = nil;
+    NSDictionary *keyboardMap = profile[KEY_KEYBOARD_MAP];
+
+    // Search for a keymapping with an action that references a profile.
+    [keyboardMap enumerateKeysAndObjectsUsingBlock:^(id  _Nonnull key, id  _Nonnull keyMap, BOOL * _Nonnull stop) {
+        int action = [[keyMap objectForKey:@"Action"] intValue];
+        if (action == KEY_ACTION_NEW_TAB_WITH_PROFILE ||
+            action == KEY_ACTION_NEW_WINDOW_WITH_PROFILE ||
+            action == KEY_ACTION_SPLIT_HORIZONTALLY_WITH_PROFILE ||
+            action == KEY_ACTION_SPLIT_VERTICALLY_WITH_PROFILE ||
+            action == KEY_ACTION_SET_PROFILE) {
+            NSString *referencedGuid = [keyMap objectForKey:@"Text"];
+            if ([referencedGuid isEqualToString:guid]) {
+                theKey = [[key copy] autorelease];
+                *stop = YES;
             }
-        } while (change);
-        if (!anyChange) {
-            return nil;
-        } else {
-            return mutableBookmark;
         }
+    }];
+    return theKey;
+}
+
++ (Profile *)removeMappingsReferencingGuid:(NSString*)guid fromBookmark:(Profile *)bookmark {
+    if (bookmark) {
+        NSMutableDictionary *mutableBookmark = nil;
+        NSString *keyToRemove = [self keyForMappingReferencingProfileWithGuid:guid inProfile:bookmark];
+        while (keyToRemove) {
+            NSInteger i = [[self sortedKeysForKeyMappingsInProfile:mutableBookmark ?: bookmark] indexOfObject:keyToRemove];
+            if (i != NSNotFound) {
+                if (!mutableBookmark) {
+                    mutableBookmark = [[bookmark mutableCopy] autorelease];
+                }
+                [iTermKeyBindingMgr removeMappingAtIndex:i inBookmark:mutableBookmark];
+            } else {
+                ELog(@"Profile with guid %@ has key mapping referencing guid %@ with key %@ but I can't find it in sorted keys",
+                     bookmark[KEY_GUID],
+                     guid,
+                     keyToRemove);
+                break;
+            }
+            keyToRemove = [self keyForMappingReferencingProfileWithGuid:guid inProfile:mutableBookmark ?: bookmark];
+        };
+        return mutableBookmark;
     } else {
         BOOL change;
         do {

@@ -11,6 +11,7 @@
 #import "iTermApplicationDelegate.h"
 #import "iTermController.h"
 #import "iTermPreferences.h"
+#import "iTermShortcut.h"
 #import "NSStringITerm.h"
 #import "PreferencePanel.h"
 #import "PseudoTerminal.h"
@@ -41,6 +42,59 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     "#{window_flags}\t"
     "#{?window_active,1,0}\"";
 
+@interface iTermInitialDirectory(Tmux)
+@end
+
+@implementation iTermInitialDirectory(Tmux)
+
+- (NSString *)tmuxNewWindowCommandInSession:(NSString *)session {
+    NSArray *args = @[ @"new-window", @"-PF '#{window_id}'" ];
+    
+    if (session) {
+        NSString *targetSessionArg = [NSString stringWithFormat:@"\"%@:+\"", [session stringByEscapingQuotes]];
+        NSArray *insertionArguments = @[ @"-a",
+                                         @"-t",
+                                         targetSessionArg ];
+        args = [args arrayByAddingObjectsFromArray:insertionArguments];
+    }
+    return [self tmuxCommandByAddingCustomDirectoryWithArgs:args];
+}
+
+- (NSString *)tmuxNewWindowCommand {
+    return [self tmuxNewWindowCommandInSession:nil];
+}
+
+- (NSString *)tmuxSplitWindowCommand:(int)wp vertically:(BOOL)splitVertically {
+    NSArray *args = @[ @"split-window",
+                       splitVertically ? @"-h": @"-v",
+                       @"-t",
+                       [NSString stringWithFormat:@"%%%d", wp] ];
+    return [self tmuxCommandByAddingCustomDirectoryWithArgs:args];
+}
+
+- (NSString *)tmuxCustomDirectoryParameter {
+    switch (self.mode) {
+        case iTermInitialDirectoryModeHome:
+            return nil;
+        case iTermInitialDirectoryModeCustom:
+            return [self.customDirectory stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
+        case iTermInitialDirectoryModeRecycle:
+            return @"#{pane_current_path}";
+    }
+}
+
+- (NSString *)tmuxCommandByAddingCustomDirectoryWithArgs:(NSArray *)args {
+    NSString *customDirectory = [self tmuxCustomDirectoryParameter];
+    if (customDirectory) {
+        NSString *escapedCustomDirectory= [customDirectory stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
+        NSString *customDirectoryArgument = [NSString stringWithFormat:@"-c '%@'", escapedCustomDirectory];
+        args = [args arrayByAddingObject:customDirectoryArgument];
+    }
+    
+    return [args componentsJoinedByString:@" "];
+}
+
+@end
 
 @interface TmuxController ()
 
@@ -73,10 +127,13 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     NSTimer *listSessionsTimer_;  // Used to do a cancelable delayed perform of listSessions.
     NSTimer *listWindowsTimer_;  // Used to do a cancelable delayed perform of listWindows.
     BOOL ambiguousIsDoubleWidth_;
+    NSMutableDictionary<NSNumber *, NSDictionary *> *_hotkeys;
+    NSMutableSet<NSNumber *> *_paneIDs;  // existing pane IDs
 
     // Maps a window id string to a dictionary of window flags defined by TmuxWindowOpener (see the
     // top of its header file)
     NSMutableDictionary *_windowOpenerOptions;
+    BOOL _manualOpenRequested;
 }
 
 @synthesize gateway = gateway_;
@@ -90,12 +147,14 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     self = [super init];
     if (self) {
         gateway_ = [gateway retain];
+        _paneIDs = [[NSMutableSet alloc] init];
         windowPanes_ = [[NSMutableDictionary alloc] init];
         windows_ = [[NSMutableDictionary alloc] init];
         windowPositions_ = [[NSMutableDictionary alloc] init];
         origins_ = [[NSMutableDictionary alloc] init];
         pendingWindowOpens_ = [[NSMutableSet alloc] init];
         hiddenWindows_ = [[NSMutableSet alloc] init];
+        _hotkeys = [[NSMutableDictionary alloc] init];
         self.clientName = [[TmuxControllerRegistry sharedInstance] uniqueClientNameBasedOn:clientName];
         _windowOpenerOptions = [[NSMutableDictionary alloc] init];
         [[TmuxControllerRegistry sharedInstance] setController:self forClient:_clientName];
@@ -105,6 +164,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
 
 - (void)dealloc {
     [_clientName release];
+    [_paneIDs release];
     [gateway_ release];
     [windowPanes_ release];
     [windows_ release];
@@ -117,6 +177,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     [lastOrigins_ release];
     [_sessionGuid release];
     [_windowOpenerOptions release];
+    [_hotkeys release];
     [super dealloc];
 }
 
@@ -139,6 +200,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     [pendingWindowOpens_ addObject:n];
     TmuxWindowOpener *windowOpener = [TmuxWindowOpener windowOpener];
     windowOpener.ambiguousIsDoubleWidth = ambiguousIsDoubleWidth_;
+    windowOpener.unicodeVersion = self.unicodeVersion;
     windowOpener.windowIndex = windowIndex;
     windowOpener.name = name;
     windowOpener.size = size;
@@ -152,7 +214,11 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     windowOpener.selector = @selector(windowDidOpen:);
     windowOpener.windowOptions = _windowOpenerOptions;
     windowOpener.zoomed = windowFlags ? @([windowFlags containsString:@"Z"]) : nil;
-    [windowOpener openWindows:YES];
+    windowOpener.manuallyOpened = _manualOpenRequested;
+    _manualOpenRequested = NO;
+    if (![windowOpener openWindows:YES]) {
+        [pendingWindowOpens_ removeObject:n];
+    }
 }
 
 - (void)setLayoutInTab:(PTYTab *)tab
@@ -161,6 +227,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     DLog(@"setLayoutInTab:%@ toLayout:%@ zoomed:%@", tab, layout, zoomed);
     TmuxWindowOpener *windowOpener = [TmuxWindowOpener windowOpener];
     windowOpener.ambiguousIsDoubleWidth = ambiguousIsDoubleWidth_;
+    windowOpener.unicodeVersion = self.unicodeVersion;
     windowOpener.layout = layout;
     windowOpener.maxHistory =
         MAX([[gateway_ delegate] tmuxBookmarkSize].height,
@@ -243,8 +310,10 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
 }
 
 - (void)initialListWindowsResponse:(NSString *)response {
+    DLog(@"initialListWindowsResponse called");
     TSVDocument *doc = [response tsvDocumentWithFields:[self listWindowFields]];
     if (!doc) {
+        DLog(@"Failed to parse %@", response);
         [gateway_ abortWithErrorMessage:[NSString stringWithFormat:@"Bad response for initial list windows request: %@", response]];
         return;
     }
@@ -253,10 +322,12 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     NSNumber *newWindowAffinity = nil;
     BOOL newWindowsInTabs =
         [iTermPreferences intForKey:kPreferenceKeyOpenTmuxWindowsIn] == kOpenTmuxWindowsAsNativeTabsInNewWindow;
+    DLog(@"Iterating records...");
     for (NSArray *record in doc.records) {
+        DLog(@"Consider record %@", record);
         int wid = [self windowIdFromString:[doc valueInRecord:record forField:@"window_id"]];
         if (hiddenWindows_ && [hiddenWindows_ containsObject:[NSNumber numberWithInt:wid]]) {
-            NSLog(@"Don't open window %d because it was saved hidden.", wid);
+            ELog(@"Don't open window %d because it was saved hidden.", wid);
             haveHidden = YES;
             // Let the user know something is up.
             continue;
@@ -265,8 +336,10 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
         if (![affinities_ valuesEqualTo:[n stringValue]] && newWindowsInTabs) {
             // Create an equivalence class of all unrecognied windows to each other.
             if (!newWindowAffinity) {
+                DLog(@"Create new affinity class for %@", n);
                 newWindowAffinity = n;
             } else {
+                DLog(@"Add window id %@ to existing affinity class %@", n, [newWindowAffinity stringValue]);
                 [affinities_ setValue:[n stringValue]
                          equalToValue:[newWindowAffinity stringValue]];
             }
@@ -274,14 +347,17 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
         [windowsToOpen addObject:record];
     }
     if (windowsToOpen.count > [iTermPreferences intForKey:kPreferenceKeyTmuxDashboardLimit]) {
+        DLog(@"There are too many windows to open so just show the dashboard");
         haveHidden = YES;
         [windowsToOpen removeAllObjects];
     }
     if (haveHidden) {
+        DLog(@"Hidden windows existing, showing dashboard");
         [[TmuxDashboardController sharedInstance] showWindow:nil];
         [[[TmuxDashboardController sharedInstance] window] makeKeyAndOrderFront:nil];
     }
     for (NSArray *record in windowsToOpen) {
+        DLog(@"Open window %@", record);
         int wid = [self windowIdFromString:[doc valueInRecord:record forField:@"window_id"]];
         [self openWindowWithIndex:wid
                              name:[doc valueInRecord:record forField:@"window_name"]
@@ -290,6 +366,10 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
                            layout:[doc valueInRecord:record forField:@"window_layout"]
                        affinities:[self savedAffinitiesForWindow:wid]
                       windowFlags:[doc valueInRecord:record forField:@"window_flags"]];
+    }
+    if (windowsToOpen.count == 0) {
+        DLog(@"Did not open any windows so turn on accept notifications in tmux gateway");
+        gateway_.acceptNotifications = YES;
     }
 }
 
@@ -331,6 +411,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     NSString *listSessionsCommand = @"list-sessions -F \"#{session_name}\"";
     NSString *getAffinitiesCommand = [NSString stringWithFormat:@"show -v -q -t $%d @affinities", sessionId_];
     NSString *getOriginsCommand = [NSString stringWithFormat:@"show -v -q -t $%d @origins", sessionId_];
+    NSString *getHotkeysCommand = [NSString stringWithFormat:@"show -v -q -t $%d @hotkeys", sessionId_];
     NSString *getHiddenWindowsCommand = [NSString stringWithFormat:@"show -v -q -t $%d @hidden", sessionId_];
     NSArray *commands = @[ [gateway_ dictionaryForCommand:getSessionGuidCommand
                                            responseTarget:self
@@ -355,6 +436,11 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
                            [gateway_ dictionaryForCommand:getOriginsCommand
                                            responseTarget:self
                                          responseSelector:@selector(getOriginsResponse:)
+                                           responseObject:nil
+                                                    flags:kTmuxGatewayCommandShouldTolerateErrors],
+                           [gateway_ dictionaryForCommand:getHotkeysCommand
+                                           responseTarget:self
+                                         responseSelector:@selector(getHotkeysResponse:)
                                            responseObject:nil
                                                     flags:kTmuxGatewayCommandShouldTolerateErrors],
                            [gateway_ dictionaryForCommand:listSessionsCommand
@@ -468,7 +554,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
 - (BOOL)windowDidResize:(NSWindowController<iTermWindowController> *)term {
     NSSize size = [term tmuxCompatibleSize];
     DLog(@"The tmux-compatible size of the window is %@", NSStringFromSize(size));
-    if (size.width == 0 || size.height == 0) {
+    if (size.width <= 0 || size.height <= 0) {
         // After the last session closes a size of 0 is reported.
         return YES;
     }
@@ -489,12 +575,15 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     NSSize minSize = NSMakeSize(INFINITY, INFINITY);
     for (id windowKey in windows_) {
         PTYTab *tab = [[windows_ objectForKey:windowKey] objectAtIndex:0];
-        NSSize size = [tab maxTmuxSize];
+        NSSize size = [tab tmuxSize];
         minSize.width = MIN(minSize.width, size.width);
         minSize.height = MIN(minSize.height, size.height);
     }
-    if (minSize.width == 0 || minSize.height == 0) {
-        // After the last session closes a size of 0 is reported.
+    if (minSize.width <= 0 || minSize.height <= 0) {
+        // After the last session closes a size of 0 is reported. Apparently unplugging a monitor
+        // leads to a negative value here. That's inferred from crash report 1468853197.309853926.txt
+        // (at the time of that crash, this tested only for zero values so it passed through and
+        // asserted anyway).
         return;
     }
     if (NSEqualSizes(minSize, lastSize_)) {
@@ -544,21 +633,87 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
     }
 }
 
-- (void)guessVersion {
-    [gateway_ sendCommand:@"list-windows -F \"#{socket_path}\""
+- (void)checkForUTF8 {
+    // Issue 5359
+    [gateway_ sendCommand:@"list-sessions -F \"\t\""
            responseTarget:self
-         responseSelector:@selector(guessVersionResponse:)
+         responseSelector:@selector(checkForUTF8Response:)
            responseObject:nil
                     flags:kTmuxGatewayCommandShouldTolerateErrors];
 }
 
-- (void)guessVersionResponse:(NSString *)response {
-    if (response.length == 0) {
-        DLog(@"Looks like tmux 2.1 or earlier");
-        gateway_.maximumServerVersion = @2.1;
+- (void)guessVersion {
+    // Run commands that will fail in successively older versions.
+    // show-window-options pane-border-format will succeed in 2.3 and later (presumably. 2.3 isn't out yet)
+    // the socket_path format was added in 2.2.
+    // the session_activity format was added in 2.1
+    NSArray *commands = @[ [gateway_ dictionaryForCommand:@"show-window-options pane-border-format"
+                                           responseTarget:self
+                                         responseSelector:@selector(guessVersion23Response:)
+                                           responseObject:nil
+                                                    flags:kTmuxGatewayCommandShouldTolerateErrors],
+                           [gateway_ dictionaryForCommand:@"list-windows -F \"#{socket_path}\""
+                                           responseTarget:self
+                                         responseSelector:@selector(guessVersion22Response:)
+                                           responseObject:nil
+                                                    flags:kTmuxGatewayCommandShouldTolerateErrors],
+                           [gateway_ dictionaryForCommand:@"list-windows -F \"#{session_activity}\""
+                                           responseTarget:self
+                                         responseSelector:@selector(guessVersion21Response:)
+                                           responseObject:nil
+                                                    flags:kTmuxGatewayCommandShouldTolerateErrors]
+                           ];
+    for (NSDictionary *command in commands) {
+        [gateway_ sendCommandList:@[ command ]];
+    }
+}
+
+- (void)decreaseMaximumServerVersionTo:(NSString *)string {
+    NSDecimalNumber *number = [NSDecimalNumber decimalNumberWithString:string];
+    if (!gateway_.maximumServerVersion ||
+        [gateway_.maximumServerVersion compare:number] == NSOrderedDescending) {
+        gateway_.maximumServerVersion = number;
+        DLog(@"Decreasing maximum server version to %@", number);
+    }
+}
+
+- (void)increaseMinimumServerVersionTo:(NSString *)string {
+    NSDecimalNumber *number = [NSDecimalNumber decimalNumberWithString:string];
+    if (!gateway_.minimumServerVersion ||
+        [gateway_.minimumServerVersion compare:number] == NSOrderedAscending) {
+        gateway_.minimumServerVersion = number;
+        DLog(@"Increasing minimum server version to %@", number);
+    }
+}
+
+- (void)checkForUTF8Response:(NSString *)response {
+    if ([response containsString:@"_"]) {
+        [gateway_ abortWithErrorMessage:@"tmux is not in UTF-8 mode. Please pass the -u command line argument to tmux or change your LANG environment variable to end with “.UTF-8”."
+                                  title:@"UTF-8 Mode Not Detected"];
+    }
+}
+
+- (void)guessVersion23Response:(NSString *)response {
+    if (response == nil) {
+        [self decreaseMaximumServerVersionTo:@"2.2"];
     } else {
-        DLog(@"Looks like tmux 2.2 or later");
-        gateway_.minimumServerVersion = @2.2;
+        [self increaseMinimumServerVersionTo:@"2.3"];
+    }
+}
+
+- (void)guessVersion22Response:(NSString *)response {
+    if (response.length == 0) {
+        [self decreaseMaximumServerVersionTo:@"2.1"];
+    } else {
+        [self increaseMinimumServerVersionTo:@"2.2"];
+    }
+}
+
+- (void)guessVersion21Response:(NSString *)response {
+    if (response.length == 0) {
+        [self decreaseMaximumServerVersionTo:@"2.0"];
+    } else {
+        [self increaseMinimumServerVersionTo:@"2.1"];
     }
 }
 
@@ -648,25 +803,33 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
 }
 
 // The splitVertically parameter uses the iTerm2 conventions.
-- (void)splitWindowPane:(int)wp vertically:(BOOL)splitVertically {
+- (void)splitWindowPane:(int)wp
+             vertically:(BOOL)splitVertically
+       initialDirectory:(iTermInitialDirectory *)initialDirectory {
     // No need for a callback. We should get a layout-changed message and act on it.
-    [gateway_ sendCommand:[NSString stringWithFormat:@"split-window -%@ -t %%%d", splitVertically ? @"h": @"v", wp]
+    [gateway_ sendCommand:[initialDirectory tmuxSplitWindowCommand:wp vertically:splitVertically]
+           responseTarget:nil
+         responseSelector:nil];
+}
+
+- (void)selectPane:(int)windowPane {
+    NSString *command = [NSString stringWithFormat:@"select-pane -t %%%d", windowPane];
+    [gateway_ sendCommand:command
            responseTarget:nil
          responseSelector:nil];
 }
 
 - (void)newWindowInSession:(NSString *)targetSession
-       afterWindowWithName:(NSString *)predecessorWindow
-{
-    [gateway_ sendCommand:[NSString stringWithFormat:@"new-window -a -t \"%@:+\" -PF '#{window_id}'",
-                           [targetSession stringByEscapingQuotes]]
+          initialDirectory:(iTermInitialDirectory *)initialDirectory {
+    [gateway_ sendCommand:[initialDirectory tmuxNewWindowCommandInSession:targetSession]
            responseTarget:nil
          responseSelector:nil];
 }
 
 - (void)newWindowWithAffinity:(NSString *)windowIdString
-{
-    [gateway_ sendCommand:@"new-window -PF '#{window_id}'"
+             initialDirectory:(iTermInitialDirectory *)initialDirectory {
+    _manualOpenRequested = (windowIdString != nil);
+    [gateway_ sendCommand:[initialDirectory tmuxNewWindowCommand]
            responseTarget:self
          responseSelector:@selector(newWindowWithAffinityCreated:affinityWindow:)
            responseObject:windowIdString
@@ -715,6 +878,42 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
          responseSelector:nil];
 }
 
+- (void)setHotkeyForWindowPane:(int)windowPane to:(NSDictionary *)dict {
+    _hotkeys[@(windowPane)] = dict;
+
+    // First get a list of existing panes so we can avoid setting hotkeys for any nonexistent panes. Keeps the string from getting too long.
+    NSString *getPaneIDsCommand = [NSString stringWithFormat:@"list-panes -s -t $%d -F \"#{pane_id}\"", sessionId_];
+    [gateway_ sendCommand:getPaneIDsCommand
+           responseTarget:self
+         responseSelector:@selector(getPaneIDsResponseAndSetHotkeys:)
+           responseObject:nil
+                    flags:kTmuxGatewayCommandShouldTolerateErrors];
+}
+
+- (void)getPaneIDsResponseAndSetHotkeys:(NSString *)response {
+    [_paneIDs removeAllObjects];
+    for (NSString *pane in [response componentsSeparatedByString:@"\n"]) {
+        if (pane.length) {
+            [_paneIDs addObject:@([[pane substringFromIndex:1] intValue])];
+        }
+    }
+    [self sendCommandToSetHotkeys];
+}
+
+- (void)sendCommandToSetHotkeys {
+    NSString *command = [NSString stringWithFormat:@"set -t $%d @hotkeys \"%@\"",
+                         sessionId_, [self.hotkeysString stringByEscapingQuotes]];
+    [gateway_ sendCommand:command
+           responseTarget:nil
+         responseSelector:nil
+           responseObject:nil
+                    flags:0];
+}
+
+- (NSDictionary *)hotkeyForWindowPane:(int)windowPane {
+    return _hotkeys[@(windowPane)];
+}
+
 - (void)killWindow:(int)window
 {
     [gateway_ sendCommand:[NSString stringWithFormat:@"kill-window -t @%d", window]
@@ -724,18 +923,34 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
                     flags:0];
 }
 
+- (NSString *)breakPaneWindowPaneFlag {
+    NSDecimalNumber *version2_1 = [NSDecimalNumber decimalNumberWithString:@"2.1"];
+
+    if ([gateway_.maximumServerVersion compare:version2_1] == NSOrderedAscending) {
+        // 2.0 and earlier versions take -t for the window pane
+        return @"-t";
+    }
+    if ([gateway_.minimumServerVersion compare:version2_1] != NSOrderedAscending) {
+        // 2.1+ takes -s for the window pane
+        return @"-s";
+    }
+
+    // You shouldn't get here.
+    return @"-s";
+}
+
 - (void)breakOutWindowPane:(int)windowPane toPoint:(NSPoint)screenPoint
 {
     [windowPositions_ setObject:[NSValue valueWithPoint:screenPoint]
                          forKey:[NSNumber numberWithInt:windowPane]];
-    [gateway_ sendCommand:[NSString stringWithFormat:@"break-pane -t %%%d", windowPane]
+    [gateway_ sendCommand:[NSString stringWithFormat:@"break-pane %@ %%%d", [self breakPaneWindowPaneFlag], windowPane]
            responseTarget:nil
          responseSelector:nil];
 }
 
 - (void)breakOutWindowPane:(int)windowPane toTabAside:(NSString *)sibling
 {
-    [gateway_ sendCommand:[NSString stringWithFormat:@"break-pane -P -F \"#{window_id}\" -t %%%d", windowPane]
+    [gateway_ sendCommand:[NSString stringWithFormat:@"break-pane -P -F \"#{window_id}\" %@ %%%d", [self breakPaneWindowPaneFlag], windowPane]
            responseTarget:self
          responseSelector:@selector(windowPaneBrokeOutWithWindowId:setAffinityTo:)
            responseObject:sibling
@@ -1122,6 +1337,40 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
   }
 }
 
+- (NSString *)shortStringForHotkeyDictionary:(NSDictionary *)dict paneID:(int)wp {
+    return [NSString stringWithFormat:@"%d=%@", wp, [iTermShortcut shortStringForDictionary:dict]];
+}
+
+- (NSString *)hotkeysString {
+    NSMutableArray *parts = [NSMutableArray array];
+    [_hotkeys enumerateKeysAndObjectsUsingBlock:^(NSNumber *  _Nonnull key, NSDictionary *_Nonnull obj, BOOL * _Nonnull stop) {
+        if ([_paneIDs containsObject:key]) {
+            [parts addObject:[self shortStringForHotkeyDictionary:obj paneID:key.intValue]];
+        }
+    }];
+
+    return [parts componentsJoinedByString:@" "];
+}
+
+- (void)getHotkeysResponse:(NSString *)result {
+    [_hotkeys removeAllObjects];
+    if (result.length > 0) {
+        [_hotkeys removeAllObjects];
+        NSArray *parts = [result componentsSeparatedByString:@" "];
+        for (NSString *part in parts) {
+            NSInteger equals = [part rangeOfString:@"="].location;
+            if (equals != NSNotFound && equals + 1 < part.length) {
+                NSString *wp = [part substringToIndex:equals];
+                NSString *shortString = [part substringFromIndex:equals + 1];
+                NSDictionary *dict = [iTermShortcut dictionaryForShortString:shortString];
+                if (dict) {
+                    _hotkeys[@(wp.intValue)] = dict;
+                }
+            }
+        }
+    }
+}
+
 - (int)windowIdFromString:(NSString *)s
 {
     if (s.length < 2 || [s characterAtIndex:0] != '@') {
@@ -1208,7 +1457,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
         if (siblings.count == 1) {
             // This is a wee hack. If a tmux Window is in a native window with one tab
             // then create an equivalence class containing only (wid, wid+"_ph"). ph=placeholder
-            // The equivalence class's existance signals not to apply the default mode for
+            // The equivalence class's existence signals not to apply the default mode for
             // unrecognized windows.
             exemplar = [exemplar stringByAppendingString:@"_ph"];
         }
@@ -1322,8 +1571,7 @@ static NSString *kListWindowsFormat = @"\"#{session_name}\t#{window_id}\t"
 }
 
 - (void)newWindowWithAffinityCreated:(NSString *)responseStr
-                      affinityWindow:(NSString *)affinityWindow  // Value passed in to -newWindowWithAffinity:, may be nil
-{
+                      affinityWindow:(NSString *)affinityWindow {  // Value passed in to -newWindowWithAffinity:, may be nil
     if ([responseStr hasPrefix:@"@"]) {
         NSString  *windowId = [NSString stringWithInt:[[responseStr substringFromIndex:1] intValue]];
         if (affinityWindow) {

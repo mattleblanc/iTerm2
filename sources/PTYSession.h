@@ -42,6 +42,7 @@ extern NSString *const kPTYSessionCapturedOutputDidChange;
 @class iTermCommandHistoryCommandUseMO;
 @class iTermController;
 @class iTermGrowlDelegate;
+@class iTermPromptOnCloseReason;
 @class iTermQuickLookController;
 @class SessionView;
 
@@ -107,6 +108,10 @@ typedef enum {
 // isn't necessarily selected.
 - (BOOL)sessionIsActiveInTab:(PTYSession *)session;
 
+// Is this session active in a currently selected tab? This ignores whether the
+// window is key.
+- (BOOL)sessionIsActiveInSelectedTab:(PTYSession *)session;
+
 // Session-initiated name change.
 - (void)nameOfSession:(PTYSession *)session didChangeTo:(NSString *)newName;
 
@@ -169,6 +174,15 @@ typedef enum {
 // Indicates if the splits are currently being dragged. Affects how resizing works for tmux tabs.
 - (BOOL)sessionBelongsToTabWhoseSplitsAreBeingDragged;
 
+// User double clicked on title bar
+- (void)sessionDoubleClickOnTitleBar;
+
+// Returns the 0-based pane number to use in $ITERM_SESSION_ID.
+- (NSUInteger)sessionPaneNumber:(PTYSession *)session;
+
+// The background color changed.
+- (void)sessionBackgroundColorDidChange:(PTYSession *)session;
+
 @end
 
 @class SessionView;
@@ -207,7 +221,7 @@ typedef enum {
 @property(nonatomic, assign) BOOL newOutput;
 
 // Do we need to prompt on close for this session?
-@property(nonatomic, readonly) BOOL promptOnClose;
+@property(nonatomic, readonly) iTermPromptOnCloseReason *promptOnCloseReason;
 
 // Array of subprocessess names.
 @property(nonatomic, readonly) NSArray *childJobNames;
@@ -281,6 +295,9 @@ typedef enum {
 // True if mouse movements are sent to the host.
 @property(nonatomic, assign) BOOL xtermMouseReporting;
 
+// True if the mouse wheel movements are sent to the host.
+@property(nonatomic, assign) BOOL xtermMouseReportingAllowMouseWheel;
+
 // Profile for this session
 @property(nonatomic, copy) Profile *profile;
 
@@ -340,6 +357,9 @@ typedef enum {
 
 @property(nonatomic, retain) TmuxController *tmuxController;
 
+// Call this on tmux clients to get the session with the tmux gateway.
+@property(nonatomic, readonly) PTYSession *tmuxGatewaySession;
+
 @property(nonatomic, readonly) VT100RemoteHost *currentHost;
 
 @property(nonatomic, readonly) int tmuxPane;
@@ -363,9 +383,9 @@ typedef enum {
 
 // Commands issued, directories entered, and hosts connected to during this session.
 // Requires shell integration.
-@property(nonatomic, readonly) NSMutableArray *commands;  // of NSString
-@property(nonatomic, readonly) NSMutableArray *directories;  // of NSString
-@property(nonatomic, readonly) NSMutableArray *hosts;  // of VT100RemoteHost
+@property(nonatomic, readonly) NSMutableArray<NSString *> *commands;  // of NSString
+@property(nonatomic, readonly) NSMutableArray<NSString *> *directories;  // of NSString
+@property(nonatomic, readonly) NSMutableArray<VT100RemoteHost *> *hosts;  // of VT100RemoteHost
 
 // Session-defined and user-defined variables. Session-defined vars start with "session." and
 // user-defined variables start with "user.".
@@ -624,7 +644,7 @@ typedef enum {
 - (void)queueAnnouncement:(iTermAnnouncementViewController *)announcement
                identifier:(NSString *)identifier;
 
-- (void)tryToRunShellIntegrationInstaller;
+- (void)tryToRunShellIntegrationInstallerWithPromptCheck:(BOOL)promptCheck;
 
 - (NSDictionary *)arrangementWithContents:(BOOL)includeContents;
 
@@ -649,6 +669,12 @@ typedef enum {
 
 // Set a value in the session's dictionary without affecting the backing profile.
 - (void)setSessionSpecificProfileValues:(NSDictionary *)newValues;
+
+- (void)useTransparencyDidChange;
+
+- (void)performKeyBindingAction:(int)keyBindingAction parameter:(NSString *)keyBindingText event:(NSEvent *)event;
+
+- (void)setColorsFromPresetNamed:(NSString *)presetName;
 
 #pragma mark - Testing utilities
 

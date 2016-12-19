@@ -3,6 +3,7 @@
 #import "SessionView.h"
 #import "DebugLogging.h"
 #import "FutureMethods.h"
+#import "iTermAdvancedSettingsModel.h"
 #import "iTermAnnouncementViewController.h"
 #import "iTermPreferences.h"
 #import "NSView+iTerm.h"
@@ -47,6 +48,7 @@ static NSDate* lastResizeDate_;
     SessionTitleView *_title;
     
     BOOL _inAddSubview;
+    NSView *_subviewWithLayer;
 }
 
 + (double)titleHeight {
@@ -109,13 +111,45 @@ static NSDate* lastResizeDate_;
     [_currentAnnouncement dismiss];
     [_currentAnnouncement release];
     [_announcements release];
+    [_subviewWithLayer release];
     while (self.trackingAreas.count) {
         [self removeTrackingArea:self.trackingAreas[0]];
     }
     [super dealloc];
 }
 
+- (void)setUseSubviewWithLayer:(BOOL)useSubviewWithLayer {
+    if (useSubviewWithLayer == _useSubviewWithLayer) {
+        return;
+    }
+    _useSubviewWithLayer = useSubviewWithLayer;
+
+    if (!_subviewWithLayer && _useSubviewWithLayer) {
+        _subviewWithLayer = [[NSView alloc] initWithFrame:self.bounds];
+        _subviewWithLayer.wantsLayer = YES;
+        [_subviewWithLayer addSubview:_scrollview];
+        if (_currentAnnouncement.view) {
+            [_subviewWithLayer addSubview:_currentAnnouncement.view];
+        }
+        [_subviewWithLayer addSubview:_findView.view];
+        [self addSubview:_subviewWithLayer];
+    } else if (_subviewWithLayer && !_useSubviewWithLayer) {
+        [self addSubview:_scrollview];
+        if (_currentAnnouncement.view) {
+            [self addSubview:_currentAnnouncement.view];
+        }
+        [self addSubview:_findView.view];
+        [_subviewWithLayer removeFromSuperview];
+        [_subviewWithLayer release];
+        _subviewWithLayer = nil;
+    }
+}
+
 - (void)addSubview:(NSView *)aView {
+    if (_useSubviewWithLayer) {
+        [super addSubview:aView];
+        return;
+    }
     BOOL wasRunning = _inAddSubview;
     _inAddSubview = YES;
     if (!wasRunning && _findView && aView != [_findView view]) {
@@ -131,12 +165,30 @@ static NSDate* lastResizeDate_;
 }
 
 - (void)updateLayout {
+    [_subviewWithLayer setFrame:self.bounds];
     if ([_delegate sessionViewShouldUpdateSubviewsFramesAutomatically]) {
         if (self.showTitle) {
             [self updateTitleFrame];
         } else {
             [self updateScrollViewFrame];
             [self updateFindViewFrame];
+        }
+    } else {
+        // Don't resize anything but do keep it all top-aligned.
+        if (self.showTitle) {
+            NSRect aRect = [self frame];
+            CGFloat maxY = aRect.size.height;
+            if (_showTitle) {
+                maxY -= _title.frame.size.height;
+                [_title setFrame:NSMakeRect(0,
+                                            maxY,
+                                            _title.frame.size.width,
+                                            _title.frame.size.height)];
+            }
+            NSRect frame = _scrollview.frame;
+            maxY -= frame.size.height;
+            frame.origin.y = maxY;
+            _scrollview.frame = frame;
         }
     }
 }
@@ -206,7 +258,7 @@ static NSDate* lastResizeDate_;
 
 // It's very expensive for PTYTextView to own its own tracking events because its frame changes
 // constantly, plus it can miss mouse exit events and spurious mouse enter events (issue 3345).
-// I beleive it also caused hangs (issue 3974).
+// I believe it also caused hangs (issue 3974).
 - (void)updateTrackingAreas {
     if ([self window]) {
         int trackingOptions;
@@ -336,6 +388,7 @@ static NSDate* lastResizeDate_;
                                                                session:session
                                                               delegate:[MovePaneController sharedInstance]
                                                                   move:move];
+    _splitSelectionView.wantsLayer = [iTermAdvancedSettingsModel useLayers];
     [_splitSelectionView setFrameOrigin:NSMakePoint(0, 0)];
     [_splitSelectionView setAutoresizingMask:NSViewWidthSizable|NSViewHeightSizable];
     [self addSubview:_splitSelectionView];
@@ -407,6 +460,7 @@ static NSDate* lastResizeDate_;
                                                                                0,
                                                                                frame.size.width,
                                                                                frame.size.height)];
+    _splitSelectionView.wantsLayer = [iTermAdvancedSettingsModel useLayers];
     [self addSubview:_splitSelectionView];
     [_splitSelectionView release];
     [[self window] orderFront:nil];
@@ -522,8 +576,8 @@ static NSDate* lastResizeDate_;
          VT100GridSizeDescription(gridSize), NSStringFromSize(cellSize));
     
     NSSize dim = NSMakeSize(gridSize.width, gridSize.height);
-    NSSize innerSize = NSMakeSize(cellSize.width * dim.width + MARGIN * 2,
-                                  cellSize.height * dim.height + VMARGIN * 2);
+    NSSize innerSize = NSMakeSize(cellSize.width * dim.width + [iTermAdvancedSettingsModel terminalMargin] * 2,
+                                  cellSize.height * dim.height + [iTermAdvancedSettingsModel terminalVMargin] * 2);
     const BOOL hasScrollbar = [[self scrollview] hasVerticalScroller];
     NSSize size =
         [PTYScrollView frameSizeForContentSize:innerSize
@@ -626,6 +680,14 @@ static NSDate* lastResizeDate_;
 
 - (void)beginDrag {
     [_delegate sessionViewBeginDrag];
+}
+
+- (void)doubleClickOnTitleView {
+    [_delegate sessionViewDoubleClickOnTitleBar];
+}
+
+- (void)sessionTitleViewBecomeFirstResponder {
+    [_delegate sessionViewBecomeFirstResponder];
 }
 
 - (void)addAnnouncement:(iTermAnnouncementViewController *)announcement {

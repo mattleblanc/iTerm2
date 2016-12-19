@@ -82,16 +82,16 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     [super dealloc];
 }
 
-- (void)openWindows:(BOOL)initial {
+- (BOOL)openWindows:(BOOL)initial {
     DLog(@"openWindows initial=%d", (int)initial);
     if (!self.layout) {
-        DLog(@"Bad layout");
-        return;
+        [gateway_ abortWithErrorMessage:[NSString stringWithFormat:@"Can't open window: missing layout"]];
+        return NO;
     }
     self.parseTree = [[TmuxLayoutParser sharedInstance] parsedLayoutFromString:self.layout];
     if (!self.parseTree) {
         [gateway_ abortWithErrorMessage:[NSString stringWithFormat:@"Error parsing layout %@", self.layout]];
-        return;
+        return NO;
     }
     NSMutableArray *cmdList = [NSMutableArray array];
     DLog(@"Parse this tree: %@", self.parseTree);
@@ -109,6 +109,7 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     }
     DLog(@"Depth-first search of parse tree gives command list %@", cmdList);
     [gateway_ sendCommandList:cmdList initial:initial];
+    return YES;
 }
 
 - (void)updateLayoutInTab:(PTYTab *)tab {
@@ -239,7 +240,8 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     NSNumber *wp = [info objectAtIndex:0];
     NSNumber *alt = [info objectAtIndex:1];
     NSArray *history = [[TmuxHistoryParser sharedInstance] parseDumpHistoryResponse:response
-                                                             ambiguousIsDoubleWidth:ambiguousIsDoubleWidth_];
+                                                             ambiguousIsDoubleWidth:ambiguousIsDoubleWidth_
+                                                                     unicodeVersion:self.unicodeVersion];
     if (history) {
         if ([alt boolValue]) {
             [altHistories_ setObject:history forKey:wp];
@@ -256,29 +258,38 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     [self requestDidComplete];
 }
 
+static BOOL IsOctalDigit(char c) {
+    return c >= '0' && c <= '7';
+}
+
+static int OctalValue(const char *bytes) {
+    int value = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!IsOctalDigit(bytes[i])) {
+            return -1;
+        }
+        value *= 8;
+        value += bytes[i] - '0';
+    }
+    return value;
+}
+
 - (void)getPendingOutputResponse:(NSData *)response pane:(NSNumber *)wp {
     const char *bytes = response.bytes;
     NSMutableData *pending = [NSMutableData data];
     for (int i = 0; i < response.length; i++) {
         char c = bytes[i];
-        if (c == '\\') {
-            if (i + 3 >= response.length) {
-                DLog(@"Bogus pending output (truncated): %@", response);
-                return;
+
+        // TODO: Fix tmux and update this code.
+        if (c == '\\' &&
+            response.length >= i + 4) {
+            // tmux has a bug where control characters get escaped but backslashes do not.
+            // Only accept octal values that are control codes to minimize the chance of problems.
+            int octalValue = OctalValue(bytes + i + 1);
+            if (octalValue >= 0 && octalValue < ' ') {
+                i += 3;
+                c = octalValue;
             }
-            i++;
-            int value = 0;
-            for (int j = 0; j < 3; j++, i++) {
-                c = bytes[i];
-                if (c < '0' || c > '7') {
-                    DLog(@"Bogus pending output (non-octal): %@", response);
-                    return;
-                }
-                value *= 8;
-                value += (c - '0');
-            }
-            i--;
-            c = value;
         }
         [pending appendBytes:&c length:1];
     }
@@ -301,6 +312,7 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     DLog(@"requestDidComplete. Pending requests is now %d", pendingRequests_);
     if (pendingRequests_ == 0) {
         NSWindowController<iTermWindowController> *term = nil;
+        BOOL isNewWindow = NO;
         if (!tabToUpdate_) {
             DLog(@"Have no tab to update.");
             if (![[[PTYTab tmuxBookmark] objectForKey:KEY_PREVENT_TAB] boolValue]) {
@@ -320,6 +332,7 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
             }
             if (!term) {
                 term = [[iTermController sharedInstance] openTmuxIntegrationWindowUsingProfile:[PTYTab tmuxBookmark]];
+                isNewWindow = YES;
                 DLog(@"Opened a new window %@", term);
             }
         }
@@ -383,6 +396,10 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
             [self.target performSelector:self.selector
                               withObject:[NSNumber numberWithInt:windowIndex_]];
         }
+        if (isNewWindow) {
+#warning TODO Make iTermController not know about PseudoTerminal so I don't have to do this cast.
+            [[iTermController sharedInstance] didFinishCreatingTmuxWindow:(PseudoTerminal *)term];
+        }
     }
 }
 
@@ -392,6 +409,9 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
                                                  callingSelector:@selector(decorateWindowPane:)
                                                         onTarget:self
                                                       withObject:nil];
+    if (self.manuallyOpened) {
+        parseTree[kLayoutDictTabOpenedManually] = @YES;
+    }
 }
 
 // Callback for DFS of parse tree from decorateParseTree:
@@ -413,6 +433,11 @@ NSString *const kTmuxWindowOpenerWindowOptionStyleValueFullScreen = @"FullScreen
     NSDictionary *state = [states_ objectForKey:n];
     if (state) {
         [parseTree setObject:state forKey:kLayoutDictStateKey];
+    }
+
+    NSDictionary *hotkey = [controller_ hotkeyForWindowPane:n.intValue];
+    if (hotkey) {
+        parseTree[kLayoutDictHotkeyKey] = hotkey;
     }
 
     return nil;

@@ -29,7 +29,10 @@
 
 #import "DebugLogging.h"
 #import "iTermDynamicProfileManager.h"
+#import "iTermHotKeyController.h"
 #import "iTermKeyBindingMgr.h"
+#import "iTermHotKeyMigrationHelper.h"
+#import "iTermHotKeyProfileBindingController.h"
 #import "iTermPreferences.h"
 #import "iTermProfilePreferences.h"
 #import "PreferencePanel.h"
@@ -39,7 +42,11 @@
 #import "NSFont+iTerm.h"
 #include <arpa/inet.h>
 
+NSString *const iTermUnicodeVersionDidChangeNotification = @"iTermUnicodeVersionDidChangeNotification";
+
 const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
+NSInteger iTermProfileJoinsAllSpaces = -1;
+static NSMutableArray<NSNotification *> *sDelayedNotifications;
 
 @implementation ITAddressBookMgr {
     NSNetServiceBrowser *sshBonjourBrowser;
@@ -108,6 +115,7 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
             NSMutableDictionary* aDict = [[NSMutableDictionary alloc] init];
             [ITAddressBookMgr setDefaultsInBookmark:aDict];
             [[ProfileModel sharedInstance] addBookmark:aDict];
+            [[ProfileModel sharedInstance] flush];
             [aDict release];
         }
 
@@ -133,6 +141,9 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
             // One of the dynamic profiles has the default guid.
             [[ProfileModel sharedInstance] setDefaultByGuid:originalDefaultGuid];
         }
+        
+        [[iTermHotKeyMigrationHelper sharedInstance] migrateSingleHotkeyToMulti];
+        [[iTermHotKeyProfileBindingController sharedInstance] refresh];
     }
 
     return self;
@@ -204,9 +215,6 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
     return [origColor dictionaryValue];
 }
 
-// This method always returns a color in the calibrated color space. If the
-// color space in the plist is not calibrated, it is converted (which preserves
-// the actual color values).
 + (NSColor *)decodeColor:(NSDictionary*)plist {
     return [plist colorValue];
 }
@@ -603,15 +611,16 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
 }
 
 + (NSString*)bookmarkCommand:(Profile*)bookmark
-               forObjectType:(iTermObjectType)objectType
-{
+               forObjectType:(iTermObjectType)objectType {
     BOOL custom = [[bookmark objectForKey:KEY_CUSTOM_COMMAND] isEqualToString:@"Yes"];
     if (custom) {
-        return [bookmark objectForKey:KEY_COMMAND_LINE];
-    } else {
-        return [ITAddressBookMgr loginShellCommandForBookmark:bookmark
-                                                forObjectType:objectType];
+        NSString *command = [bookmark objectForKey:KEY_COMMAND_LINE];
+        if ([[command stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet] ] length] > 0) {
+            return command;
+        }
     }
+    return [ITAddressBookMgr loginShellCommandForBookmark:bookmark
+                                            forObjectType:objectType];
 }
 
 + (NSString *)_advancedWorkingDirWithOption:(NSString *)option
@@ -676,12 +685,12 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
     return YES;
 }
 
-+ (void)removeProfile:(NSDictionary *)profile fromModel:(ProfileModel *)model {
++ (BOOL)removeProfile:(NSDictionary *)profile fromModel:(ProfileModel *)model {
     NSString *guid = profile[KEY_GUID];
     DLog(@"Remove profile with guid %@...", guid);
     if ([model numberOfBookmarks] == 1) {
         DLog(@"Refusing to remove only profile");
-        return;
+        return NO;
     }
 
     DLog(@"Removing key bindings that reference the guid being removed");
@@ -691,9 +700,9 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
 
     // Ensure all profile list views reload their data to avoid issue 4033.
     DLog(@"Posting profile was deleted notification");
-    [[NSNotificationCenter defaultCenter] postNotificationName:kProfileWasDeletedNotification
-                                                        object:nil];
+    [self postNotificationName:kProfileWasDeletedNotification object:nil userInfo:nil];
     [model flush];
+    return YES;
 }
 
 + (void)removeKeyMappingsReferringToGuid:(NSString *)badRef {
@@ -712,9 +721,44 @@ const NSTimeInterval kMinimumAntiIdlePeriod = 1.0;
         }
     }
     [iTermKeyBindingMgr removeMappingsReferencingGuid:badRef fromBookmark:nil];
-    [[NSNotificationCenter defaultCenter] postNotificationName:kKeyBindingsChangedNotification
-                                                        object:nil
-                                                      userInfo:nil];
+    [self postNotificationName:kKeyBindingsChangedNotification object:nil userInfo:nil];
+}
+
++ (void)postNotificationName:(NSString *)name object:(id)object userInfo:(id)userInfo {
+    NSNotification *notification = [NSNotification notificationWithName:name object:object userInfo:userInfo];
+    [self postNotification:notification];
+}
+
++ (void)postNotification:(NSNotification *)notification {
+    if (sDelayedNotifications) {
+        for (NSNotification *existing in sDelayedNotifications) {
+            if ([existing.name isEqualToString:notification.name] &&
+                (existing.object == notification.object || [existing.object isEqual:notification.object]) &&
+                (existing.userInfo == notification.userInfo || [existing.userInfo isEqual:notification.userInfo])) {
+                // Already have a notification like this
+                return;
+            }
+        }
+        [sDelayedNotifications addObject:notification];
+    } else {
+        [[NSNotificationCenter defaultCenter] postNotification:notification];
+    }
+}
+
++ (void)performBlockWithCoalescedNotifications:(void (^)())block {
+    if (!sDelayedNotifications) {
+        sDelayedNotifications = [[NSMutableArray alloc] init];
+
+        block();
+
+        for (NSNotification *notification in sDelayedNotifications) {
+            [[NSNotificationCenter defaultCenter] postNotification:notification];
+        }
+        [sDelayedNotifications release];
+        sDelayedNotifications = nil;
+    } else {
+        block();
+    }
 }
 
 @end

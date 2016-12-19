@@ -27,15 +27,29 @@
 #import "ProfilesWindowPreferencesViewController.h"
 #import "ProfilesSessionPreferencesViewController.h"
 
+@interface NSWindow(LazyHacks)
+- (void)safeMakeFirstResponder:(id)view;
+@end
+
+@implementation NSWindow(LazyHacks)
+
+- (void)safeMakeFirstResponder:(NSView *)view {
+    if (view.window == self) {
+        [self makeFirstResponder:self];
+    }
+}
+
+@end
+
 static NSString *const kRefreshProfileTable = @"kRefreshProfileTable";
 static const CGFloat kExtraMarginBetweenWindowBottomAndTabViewForEditCurrentSessionMode = 7;
 static const CGFloat kSideMarginsWithinInnerTabView = 11;
 NSString *const kProfileSessionNameDidEndEditing = @"kProfileSessionNameDidEndEditing";
+NSString *const kProfileSessionHotkeyDidChange = @"kProfileSessionHotkeyDidChange";
 
 @interface ProfilePreferencesViewController () <
     iTermProfilePreferencesBaseViewControllerDelegate,
     NSTabViewDelegate,
-    NSWindowDelegate,
     ProfileListViewDelegate,
     ProfilesGeneralPreferencesViewControllerDelegate>
 @end
@@ -123,6 +137,19 @@ NSString *const kProfileSessionNameDidEndEditing = @"kProfileSessionNameDidEndEd
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [super dealloc];
+}
+
+#pragma mark - iTermPreferencesBaseViewController
+
+- (void)setPreferencePanel:(NSWindowController *)preferencePanel {
+    for (iTermPreferencesBaseViewController *viewController in [self tabViewControllers]) {
+        viewController.preferencePanel = preferencePanel;
+    }
+    [super setPreferencePanel:preferencePanel];
+}
+
+- (void)windowWillClose {
+    [_profilesListView unlockSelection];
 }
 
 #pragma mark - NSViewController
@@ -217,6 +244,7 @@ NSString *const kProfileSessionNameDidEndEditing = @"kProfileSessionNameDidEndEd
     [_windowViewController layoutSubviewsForEditCurrentSessionMode];
     [_sessionViewController layoutSubviewsForEditCurrentSessionMode];
     [_advancedViewController layoutSubviewsForEditCurrentSessionMode];
+    [_keysViewController layoutSubviewsForEditCurrentSessionMode];
     NSRect newFrame = _tabView.superview.bounds;
     newFrame.size.width -= 13;
 
@@ -254,6 +282,19 @@ NSString *const kProfileSessionNameDidEndEditing = @"kProfileSessionNameDidEndEd
     [[self tabViewControllers] makeObjectsPerformSelector:@selector(reloadProfile)];
 }
 
+- (void)openToProfileWithGuidAndEditHotKey:(NSString *)guid {
+    [_profilesListView reloadData];
+    if ([[self selectedProfile][KEY_GUID] isEqualToString:guid]) {
+        [self reloadProfileInProfileViewControllers];
+    } else {
+        [self selectGuid:guid];
+    }
+    if (!self.view.window.attachedSheet) {
+        [_tabView selectTabViewItem:_keysTab];
+        [_keysViewController openHotKeyPanel:nil];
+    }
+}
+
 - (void)openToProfileWithGuid:(NSString *)guid selectGeneralTab:(BOOL)selectGeneralTab {
     [_profilesListView reloadData];
     if ([[self selectedProfile][KEY_GUID] isEqualToString:guid]) {
@@ -264,7 +305,9 @@ NSString *const kProfileSessionNameDidEndEditing = @"kProfileSessionNameDidEndEd
     if (selectGeneralTab && !self.view.window.attachedSheet) {
         [_tabView selectTabViewItem:_generalTab];
     }
-    [self.view.window performSelector:@selector(makeFirstResponder:)
+    // Use safeMakeFirstResponder in case the profile name is not visible at the time it is called.
+    // Prevents an annoying message threatening a crash that never comes.
+    [self.view.window performSelector:@selector(safeMakeFirstResponder:)
                            withObject:_generalViewController.profileNameFieldForEditCurrentSession
                            afterDelay:0];
 }
@@ -688,17 +731,15 @@ NSString *const kProfileSessionNameDidEndEditing = @"kProfileSessionNameDidEndEd
                                                         object:[_profilesListView selectedGuid]];
 }
 
+- (void)profilesGeneralPreferencesSessionHotkeyDidChange {
+    [[NSNotificationCenter defaultCenter] postNotificationName:kProfileSessionHotkeyDidChange
+                                                        object:[_profilesListView selectedGuid]];
+}
+
 #pragma mark - NSTabViewDelegate
 
 - (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)tabViewItem {
     [self resizeWindowForTabViewItem:tabViewItem animated:YES];
-}
-
-#pragma mark - NSWindowDelegate
-
-- (void)windowWillClose:(NSNotification *)notification {
-    [_generalViewController windowWillClose];
-    [_profilesListView unlockSelection];
 }
 
 @end

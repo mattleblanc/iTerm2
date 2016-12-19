@@ -99,16 +99,20 @@
     self.delegate = delegate;
 
     [[self window] setParentWindow:delegate.popupWindowController.window];
-    if (delegate.popupWindowIsInHotkeyWindow &&
-        [iTermAdvancedSettingsModel hotkeyWindowFloatsAboveOtherWindows]) {
-        self.window.level = NSPopUpMenuWindowLevel;
-    }
 
     static const NSTimeInterval kAnimationDuration = 0.15;
     self.window.alphaValue = 0;
-    [self showWindow:delegate.popupWindowController];
-    [[self window] makeKeyAndOrderFront:delegate.popupWindowController];
-
+    if (delegate.popupWindowIsInFloatingHotkeyWindow) {
+        self.window.styleMask = NSNonactivatingPanelMask;
+        self.window.collectionBehavior = (NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                          NSWindowCollectionBehaviorIgnoresCycle |
+                                          NSWindowCollectionBehaviorFullScreenAuxiliary);
+        self.window.level = NSPopUpMenuWindowLevel;
+        [self.window makeKeyAndOrderFront:nil];
+    } else {
+        [self showWindow:delegate.popupWindowController];
+        [[self window] makeKeyAndOrderFront:delegate.popupWindowController];
+    }
     [NSAnimationContext beginGrouping];
     [[NSAnimationContext currentContext] setDuration:kAnimationDuration];
     self.window.animator.alphaValue = 1;
@@ -194,7 +198,7 @@
     NSRect frame = [[self window] frame];
     frame.size.height = [[tableView_ headerView] frame].size.height + MIN(20, [model_ count]) * ([tableView_ rowHeight] + [tableView_ intercellSpacing].height);
 
-    NSPoint p = NSMakePoint(MARGIN + cx * [tv charWidth],
+    NSPoint p = NSMakePoint([iTermAdvancedSettingsModel terminalMargin] + cx * [tv charWidth],
                             ([screen numberOfLines] - [screen height] + cy) * [tv lineHeight]);
     p = [tv convertPoint:p toView:nil];
     p = [[tv window] pointToScreenCoords:p];

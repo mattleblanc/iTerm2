@@ -15,6 +15,9 @@
 // profile that may have changed.
 extern NSString *const kProfileSessionNameDidEndEditing;
 
+// Posted when a session hotkey is changed through Edit Session
+extern NSString *const kProfileSessionHotkeyDidChange;
+
 @protocol ProfilePreferencesViewControllerDelegate <NSObject>
 
 - (ProfileModel *)profilePreferencesModel;
@@ -40,11 +43,11 @@ extern NSString *const kProfileSessionNameDidEndEditing;
 - (void)selectGeneralTab;
 
 - (void)openToProfileWithGuid:(NSString *)guid selectGeneralTab:(BOOL)selectGeneralTab;
+- (void)openToProfileWithGuidAndEditHotKey:(NSString *)guid;
 
 // Update views for changed backing state.
 - (void)refresh;
 
 - (void)resizeWindowForCurrentTab;
-- (void)windowWillClose:(NSNotification *)notification;
 
 @end

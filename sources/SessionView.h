@@ -107,6 +107,12 @@
 // Returns the accepted size.
 - (NSSize)sessionViewScrollViewWillResize:(NSSize)proposedSize;
 
+// User double clicked on title view.
+- (void)sessionViewDoubleClickOnTitleBar;
+
+// Make the textview the first responder
+- (void)sessionViewBecomeFirstResponder;
+
 @end
 
 @interface SessionView : NSView <SessionTitleViewDelegate>
@@ -118,6 +124,7 @@
 @property(nonatomic, readonly) iTermAnnouncementViewController *currentAnnouncement;
 @property(nonatomic, assign) id<iTermSessionViewDelegate> delegate;
 @property(nonatomic, readonly) PTYScrollView *scrollview;
+@property(nonatomic, assign) BOOL useSubviewWithLayer;
 
 + (double)titleHeight;
 + (NSDate*)lastResizeDate;

@@ -130,14 +130,6 @@ static BOOL hasWrapped = NO;
 static void CreateComplexCharMapIfNeeded() {
     if (!complexCharMap) {
         complexCharMap = [[NSMutableDictionary alloc] initWithCapacity:1000];
-        // Add box-drawing chars, which are reserved. They are drawn using
-        // bezier paths but it's important that the keys refer to an existing
-        // string for general correctness.
-        for (int i = 0; i < 256; i++) {
-            if (lineDrawingCharFlags[i]) {
-                complexCharMap[@(charmap[i])] = [NSString stringWithFormat:@"%C", charmap[i]];
-            }
-        }
         inverseComplexCharMap = [[NSMutableDictionary alloc] initWithCapacity:1000];
     }
 }
@@ -201,23 +193,7 @@ UTF32Char CharToLongChar(unichar code, BOOL isComplex)
 }
 
 static BOOL ComplexCharKeyIsReserved(int k) {
-    switch (k) {
-        case ITERM_BOX_DRAWINGS_LIGHT_UP_AND_LEFT:
-        case ITERM_BOX_DRAWINGS_LIGHT_DOWN_AND_LEFT:
-        case ITERM_BOX_DRAWINGS_LIGHT_DOWN_AND_RIGHT:
-        case ITERM_BOX_DRAWINGS_LIGHT_UP_AND_RIGHT:
-        case ITERM_BOX_DRAWINGS_LIGHT_VERTICAL_AND_HORIZONTAL:
-        case ITERM_BOX_DRAWINGS_LIGHT_HORIZONTAL:
-        case ITERM_BOX_DRAWINGS_LIGHT_VERTICAL_AND_RIGHT:
-        case ITERM_BOX_DRAWINGS_LIGHT_VERTICAL_AND_LEFT:
-        case ITERM_BOX_DRAWINGS_LIGHT_UP_AND_HORIZONTAL:
-        case ITERM_BOX_DRAWINGS_LIGHT_DOWN_AND_HORIZONTAL:
-        case ITERM_BOX_DRAWINGS_LIGHT_VERTICAL:
-            return YES;
-
-        default:
-            return NO;
-    }
+    return k >= iTermBoxDrawingCodeMin && k <= iTermBoxDrawingCodeMax;
 }
 
 static void AllocateImageMapsIfNeeded(void) {
@@ -258,7 +234,7 @@ void SetPositionInImageChar(screen_char_t *charPtr, int x, int y)
     charPtr->backgroundColor = y;
 }
 
-void SetDecodedImage(unichar code, NSImage *image, NSData *data) {
+void SetDecodedImage(unichar code, iTermImage *image, NSData *data) {
     iTermImageInfo *imageInfo = gImages[@(code)];
     [imageInfo setImageFromImage:image data:data];
     gEncodableImageMap[@(code)] = [imageInfo dictionary];
@@ -523,10 +499,11 @@ void StringToScreenChars(NSString *s,
                          BOOL ambiguousIsDoubleWidth,
                          int* cursorIndex,
                          BOOL *foundDwc,
-                         BOOL useHFSPlusMapping) {
+                         BOOL useHFSPlusMapping,
+                         NSInteger unicodeVersion) {
     __block NSInteger j = 0;
     __block BOOL foundCursor = NO;
-    NSCharacterSet *zeroWidthSpaces = [NSCharacterSet zeroWidthSpaceCharacterSet];
+    NSCharacterSet *zeroWidthSpaces = [NSCharacterSet zeroWidthSpaceCharacterSetForUnicodeVersion:unicodeVersion];
     [s enumerateComposedCharacters:^(NSRange range,
                                      unichar baseBmpChar,
                                      NSString *composedOrNonBmpChar,
@@ -560,15 +537,26 @@ void StringToScreenChars(NSString *s,
             buf[j].complexChar = NO;
 
             isDoubleWidth = [NSString isDoubleWidthCharacter:baseBmpChar
-                                      ambiguousIsDoubleWidth:ambiguousIsDoubleWidth];
+                                      ambiguousIsDoubleWidth:ambiguousIsDoubleWidth
+                                              unicodeVersion:unicodeVersion];
         } else {
+            // Ensure the string is not longer than what we support.
+            if (composedOrNonBmpChar.length > kMaxParts) {
+                composedOrNonBmpChar = [composedOrNonBmpChar substringToIndex:kMaxParts];
+
+                // Ensure a high surrogate isn't left dangling at the end.
+                if (CFStringIsSurrogateHighCharacter([composedOrNonBmpChar characterAtIndex:kMaxParts - 1])) {
+                    composedOrNonBmpChar = [composedOrNonBmpChar substringToIndex:kMaxParts - 1];
+                }
+            }
             SetComplexCharInScreenChar(buf + j, composedOrNonBmpChar, useHFSPlusMapping);
             UTF32Char baseChar = [composedOrNonBmpChar characterAtIndex:0];
             if (IsHighSurrogate(baseChar) && composedOrNonBmpChar.length > 1) {
                 baseChar = DecodeSurrogatePair(baseChar, [composedOrNonBmpChar characterAtIndex:1]);
             }
             isDoubleWidth = [NSString isDoubleWidthCharacter:baseChar
-                                      ambiguousIsDoubleWidth:ambiguousIsDoubleWidth];
+                                      ambiguousIsDoubleWidth:ambiguousIsDoubleWidth
+                                              unicodeVersion:unicodeVersion];
         }
 
         // Append a DWC_RIGHT if the base character is double-width.
@@ -623,7 +611,7 @@ void ConvertCharsToGraphicsCharset(screen_char_t *s, int len)
 
     for (i = 0; i < len; i++) {
         assert(!s[i].complexChar);
-        s[i].complexChar = lineDrawingCharFlags[(int)(s[i].code)];
+        s[i].complexChar = NO;
         s[i].code = charmap[(int)(s[i].code)];
     }
 }

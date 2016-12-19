@@ -117,16 +117,19 @@
     if (!name) {
         [command setScriptErrorNumber:1];
         [command setScriptErrorString:@"No name given"];
+        return nil;
     }
     if (!value) {
         [command setScriptErrorNumber:2];
         [command setScriptErrorString:@"No value given"];
+        return nil;
     }
     if (![name hasPrefix:@"user."]) {
         [command setScriptErrorNumber:3];
         [command setScriptErrorString:@"Only user variables may be set. Name must start with “user.”."];
+        return nil;
     }
-    self.variables[[@"user." stringByAppendingString:name]] = value;
+    self.variables[name] = value;
     [self.textview setBadgeLabel:[self badgeLabel]];
     return value;
 }
@@ -279,6 +282,14 @@
 
 - (void)setForegroundColor:(NSColor *)color {
     [self setSessionSpecificProfileValues:@{ KEY_FOREGROUND_COLOR: [color dictionaryValue] }];
+}
+
+- (NSColor *)underlineColor {
+    return [self.colorMap colorForKey:kColorMapUnderline];
+}
+
+- (void)setUnderlineColor:(NSColor *)color {
+    [self setSessionSpecificProfileValues:@{ KEY_UNDERLINE_COLOR: [color dictionaryValue] }];
 }
 
 - (NSColor *)selectedTextColor {

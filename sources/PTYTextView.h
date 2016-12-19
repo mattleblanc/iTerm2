@@ -1,5 +1,4 @@
 #import <Cocoa/Cocoa.h>
-#import "CharacterRun.h"
 #import "ITAddressBookMgr.h"
 #import "iTerm.h"
 #import "iTermColorMap.h"
@@ -64,6 +63,7 @@ typedef NS_ENUM(NSInteger, PTYTextViewSelectionExtensionUnit) {
 @protocol PTYTextViewDelegate <NSObject>
 
 - (BOOL)xtermMouseReporting;
+- (BOOL)xtermMouseReportingAllowMouseWheel;
 - (BOOL)isPasting;
 - (void)queueKeyDown:(NSEvent *)event;
 - (void)keyDown:(NSEvent *)event;
@@ -164,6 +164,12 @@ typedef NS_ENUM(NSInteger, PTYTextViewSelectionExtensionUnit) {
 
 // Update the text view's frame needed.
 - (void)textViewResizeFrameIfNeeded;
+
+- (NSInteger)textViewUnicodeVersion;
+- (void)textViewDidRefresh;
+
+// The background color in the color map changed.
+- (void)textViewBackgroundColorDidChange;
 
 @end
 

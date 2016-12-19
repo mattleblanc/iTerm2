@@ -38,7 +38,10 @@ id gAltOpenAllRepresentedObject;
 // standard.
 int gMigrated;
 
-@implementation ProfileModel
+@implementation ProfileModel {
+    NSString *_modelName;
+    NSMutableArray<NSNotification *> *_delayedNotifications;
+}
 
 + (void)initialize
 {
@@ -50,10 +53,10 @@ int gMigrated;
     return gMigrated;
 }
 
-- (ProfileModel*)init
-{
+- (ProfileModel*)initWithName:(NSString *)modelName {
     self = [super init];
     if (self) {
+        _modelName = [modelName copy];
         bookmarks_ = [[NSMutableArray alloc] init];
         defaultBookmarkGuid_ = @"";
         journal_ = [[NSMutableArray alloc] init];
@@ -66,7 +69,7 @@ int gMigrated;
     static ProfileModel* shared = nil;
 
     if (!shared) {
-        shared = [[ProfileModel alloc] init];
+        shared = [[ProfileModel alloc] initWithName:@"Shared"];
         shared->prefs_ = [NSUserDefaults standardUserDefaults];
         shared->postChanges_ = YES;
     }
@@ -79,7 +82,7 @@ int gMigrated;
     static ProfileModel* shared = nil;
 
     if (!shared) {
-        shared = [[ProfileModel alloc] init];
+        shared = [[ProfileModel alloc] initWithName:@"Sessions"];
         shared->prefs_ = nil;
         shared->postChanges_ = NO;
     }
@@ -89,10 +92,29 @@ int gMigrated;
 
 - (void)dealloc
 {
-    [super dealloc];
     [journal_ release];
+    [_modelName release];
+    [_delayedNotifications release];
     NSLog(@"Deallocating bookmark model!");
+    [super dealloc];
 }
+
+- (Profile *)tmuxProfile {
+    Profile *profile = [self bookmarkWithName:@"tmux"];
+    if (!profile) {
+        Profile *defaultBookmark = [self defaultBookmark];
+        NSMutableDictionary *tmuxProfile = [[defaultBookmark mutableCopy] autorelease];
+        [tmuxProfile setObject:@"tmux" forKey:KEY_NAME];
+        [tmuxProfile setObject:[ProfileModel freshGuid] forKey:KEY_GUID];
+        [tmuxProfile setObject:[NSNumber numberWithInt:1000]
+                         forKey:KEY_SCROLLBACK_LINES];
+        [self addBookmark:tmuxProfile];
+        [self postChangeNotification];
+        profile = tmuxProfile;
+    }
+    return profile;
+}
+
 
 - (int)numberOfBookmarks
 {
@@ -596,8 +618,18 @@ int gMigrated;
     return [tags allObjects];
 }
 
-- (Profile*)setObject:(id)object forKey:(NSString*)key inBookmark:(Profile*)bookmark
-{
+- (Profile *)setObjectsFromDictionary:(NSDictionary *)dictionary inProfile:(Profile *)profile {
+    NSMutableDictionary *newDict = [[profile mutableCopy] autorelease];
+    [dictionary enumerateKeysAndObjectsUsingBlock:^(id  _Nonnull key, id  _Nonnull obj, BOOL * _Nonnull stop) {
+        [newDict setObject:obj forKey:key];
+    }];
+    NSString *guid = [profile objectForKey:KEY_GUID];
+    Profile *newProfile = [NSDictionary dictionaryWithDictionary:newDict];
+    [self setBookmark:newProfile withGuid:guid];
+    return newProfile;
+}
+
+- (Profile*)setObject:(id)object forKey:(NSString*)key inBookmark:(Profile*)bookmark {
     NSMutableDictionary* newDict = [NSMutableDictionary dictionaryWithDictionary:bookmark];
     if (object == nil) {
         [newDict removeObjectForKey:key];
@@ -657,9 +689,7 @@ int gMigrated;
     // the new profile.
     dict[KEY_ORIGINAL_GUID] = [[bookmark[KEY_GUID] copy] autorelease];
     [[ProfileModel sessionsInstance] setBookmark:dict withGuid:origGuid];
-    [[NSNotificationCenter defaultCenter] postNotificationName:kReloadAllProfiles
-                                                        object:nil
-                                                      userInfo:nil];
+    [self postNotificationName:kReloadAllProfiles object:nil userInfo:nil];
 }
 
 - (void)moveGuid:(NSString*)guid toRow:(int)destinationRow
@@ -690,13 +720,56 @@ int gMigrated;
     [self postChangeNotification];
 }
 
+- (void)performBlockWithCoalescedNotifications:(void (^)())block {
+    if (!_delayedNotifications) {
+        _delayedNotifications = [[NSMutableArray alloc] init];
+
+        block();
+
+        for (NSNotification *notification in _delayedNotifications) {
+            [[NSNotificationCenter defaultCenter] postNotification:notification];
+        }
+        [_delayedNotifications release];
+        _delayedNotifications = nil;
+        [self flush];
+    } else {
+        block();
+    }
+}
+
+- (void)postNotificationName:(NSString *)name object:(id)object userInfo:(id)userInfo {
+    NSNotification *notification = [NSNotification notificationWithName:name object:object userInfo:userInfo];
+    [self postNotification:notification];
+}
+
+- (void)postNotification:(NSNotification *)notification {
+    if (_delayedNotifications) {
+        NSNotification *last = [_delayedNotifications lastObject];
+        if ([notification.name isEqualToString:kReloadAddressBookNotification] &&
+            [last.name isEqualToString:notification.name]) {
+            // Special hack to combine journals to avoid sending a million notifications each with a
+            // small journal.
+            NSArray *lastArray = last.userInfo[@"array"] ?: @[];
+            NSArray *thisArray = notification.userInfo[@"array"] ?: @[];
+            NSArray *combinedArray = [lastArray arrayByAddingObjectsFromArray:thisArray];
+            NSNotification *combined = [NSNotification notificationWithName:notification.name object:nil userInfo:@{ @"array": combinedArray }];
+            [_delayedNotifications removeLastObject];
+            [_delayedNotifications addObject:combined];
+        } else {
+            [_delayedNotifications addObject:notification];
+        }
+    } else {
+        [[NSNotificationCenter defaultCenter] postNotification:notification];
+    }
+}
+
 - (void)postChangeNotification {
     DLog(@"Post bookmark changed notification");
     if (postChanges_) {
         DLog(@"Posting notification");
-        [[NSNotificationCenter defaultCenter] postNotificationName:kReloadAddressBookNotification
-                                                            object:nil
-                                                          userInfo:[NSDictionary dictionaryWithObject:journal_ forKey:@"array"]];
+        // NOTE: if userInfo is ever changed update -postNotification:, which
+        // has code that coalesces userinfos for this notification.
+        [self postNotificationName:kReloadAddressBookNotification object:nil userInfo:@{ @"array": journal_ }];
     }
     [journal_ release];
     journal_ = [[NSMutableArray alloc] init];
@@ -724,6 +797,9 @@ int gMigrated;
 }
 
 - (void)flush {
+    if (_delayedNotifications) {
+        return;
+    }
     // If KEY_NEW_BOOKMARKS is a string then it was overridden at the command line to point at a
     // file and we shouldn't save it to user defaults. If it wasn't overridden it'll be an array.
     if (![[prefs_ objectForKey:KEY_NEW_BOOKMARKS] isKindOfClass:[NSString class]]) {

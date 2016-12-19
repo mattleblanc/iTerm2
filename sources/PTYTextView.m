@@ -1,8 +1,6 @@
 #import "PTYTextView.h"
 
 #import "AsyncHostLookupController.h"
-#import "CharacterRun.h"
-#import "CharacterRunInline.h"
 #import "charmaps.h"
 #import "FileTransferManager.h"
 #import "FontSizeEstimator.h"
@@ -45,6 +43,7 @@
 #import "NSMutableAttributedString+iTerm.h"
 #import "NSPasteboard+iTerm.h"
 #import "NSStringITerm.h"
+#import "NSURL+iTerm.h"
 #import "NSWindow+PSM.h"
 #import "PasteboardHistory.h"
 #import "PointerController.h"
@@ -113,7 +112,8 @@ static const int kDragThreshold = 3;
     iTermSelectionDelegate,
     iTermSelectionScrollHelperDelegate,
     NSDraggingSource,
-    NSMenuDelegate>
+    NSMenuDelegate,
+    NSPopoverDelegate>
 
 // Set the hostname this view is currently waiting for AsyncHostLookupController to finish looking
 // up.
@@ -123,6 +123,7 @@ static const int kDragThreshold = 3;
 @property(nonatomic, retain) iTermFindCursorView *findCursorView;
 @property(nonatomic, retain) NSWindow *findCursorWindow;  // For find-cursor animation
 @property(nonatomic, retain) iTermQuickLookController *quickLookController;
+@property (strong, readwrite, nullable) NSTouchBar *touchBar;
 
 // Set when a context menu opens, nilled when it closes. If the data source changes between when we
 // ask the context menu to open and when the main thread enters a tracking runloop, the text under
@@ -280,8 +281,8 @@ static const int kDragThreshold = 3;
         _selection = [[iTermSelection alloc] init];
         _selection.delegate = self;
         _oldSelection = [_selection copy];
-        _drawingHelper.underlineRange =
-            VT100GridWindowedRangeMake(VT100GridCoordRangeMake(-1, -1, -1, -1), 0, 0);
+        _drawingHelper.underlinedRange =
+            VT100GridAbsWindowedRangeMake(VT100GridAbsCoordRangeMake(-1, -1, -1, -1), 0, 0);
         _timeOfLastBlink = [NSDate timeIntervalSinceReferenceDate];
         [[self window] useOptimizedDrawing:YES];
 
@@ -316,7 +317,11 @@ static const int kDragThreshold = 3;
                                                  selector:@selector(hostnameLookupSucceeded:)
                                                      name:kHostnameLookupSucceeded
                                                    object:nil];
-
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(imageDidLoad:)
+                                                     name:iTermImageDidLoad
+                                                   object:nil];
+        
         _semanticHistoryController = [[iTermSemanticHistoryController alloc] init];
         _semanticHistoryController.delegate = self;
         _semanticHistoryDragged = NO;
@@ -465,8 +470,8 @@ static const int kDragThreshold = 3;
     // During initialization, this may be called before the non-ascii font is set so we use a system
     // font as a placeholder.
     NSDictionary *theAttributes =
-        @{ NSBackgroundColorAttributeName: [self defaultBackgroundColor],
-           NSForegroundColorAttributeName: [self defaultTextColor],
+        @{ NSBackgroundColorAttributeName: [self defaultBackgroundColor] ?: [NSColor blackColor],
+           NSForegroundColorAttributeName: [self defaultTextColor] ?: [NSColor whiteColor],
            NSFontAttributeName: self.nonAsciiFont ?: [NSFont systemFontOfSize:12],
            NSUnderlineStyleAttributeName: @(NSUnderlineStyleSingle | NSUnderlineByWordMask) };
 
@@ -527,12 +532,16 @@ static const int kDragThreshold = 3;
 - (BOOL)resignFirstResponder {
     [_altScreenMouseScrollInferer firstResponderDidChange];
     [self removeUnderline];
+    DLog(@"resignFirstResponder %@", self);
+    DLog(@"%@", [NSThread callStackSymbols]);
     return YES;
 }
 
 - (BOOL)becomeFirstResponder {
     [_altScreenMouseScrollInferer firstResponderDidChange];
     [_delegate textViewDidBecomeFirstResponder];
+    DLog(@"becomeFirstResponder %@", self);
+    DLog(@"%@", [NSThread callStackSymbols]);
     return YES;
 }
 
@@ -616,8 +625,7 @@ static const int kDragThreshold = 3;
 
 - (void)setCursorType:(ITermCursorType)value {
     _drawingHelper.cursorType = value;
-    [self setCursorNeedsDisplay];
-    [self refresh];
+    [self markCursorDirty];
 }
 
 - (NSDictionary*)markedTextAttributes {
@@ -650,8 +658,10 @@ static const int kDragThreshold = 3;
     return _secondaryFont.font;
 }
 
-+ (NSSize)charSizeForFont:(NSFont*)aFont horizontalSpacing:(double)hspace verticalSpacing:(double)vspace baseline:(double*)baseline
-{
++ (NSSize)charSizeForFont:(NSFont *)aFont
+        horizontalSpacing:(double)hspace
+          verticalSpacing:(double)vspace
+                 baseline:(double *)baseline {
     FontSizeEstimator* fse = [FontSizeEstimator fontSizeEstimatorForFont:aFont];
     NSSize size = [fse size];
     size.width = ceil(size.width * hspace);
@@ -686,33 +696,14 @@ static const int kDragThreshold = 3;
     self.lineHeight = ceil(_charHeightWithoutSpacing * verticalSpacing);
 
     _primaryFont.font = aFont;
-    _primaryFont.baselineOffset = baseline;
     _primaryFont.boldVersion = [_primaryFont computedBoldVersion];
     _primaryFont.italicVersion = [_primaryFont computedItalicVersion];
     _primaryFont.boldItalicVersion = [_primaryFont computedBoldItalicVersion];
 
     _secondaryFont.font = nonAsciiFont;
-    _secondaryFont.baselineOffset = baseline;
     _secondaryFont.boldVersion = [_secondaryFont computedBoldVersion];
     _secondaryFont.italicVersion = [_secondaryFont computedItalicVersion];
     _secondaryFont.boldItalicVersion = [_secondaryFont computedBoldItalicVersion];
-
-    // Force the secondary font to use the same baseline as the primary font.
-    _secondaryFont.baselineOffset = _primaryFont.baselineOffset;
-    if (_secondaryFont.boldVersion) {
-        if (_primaryFont.boldVersion) {
-            _secondaryFont.boldVersion.baselineOffset = _primaryFont.boldVersion.baselineOffset;
-        } else {
-            _secondaryFont.boldVersion.baselineOffset = _secondaryFont.baselineOffset;
-        }
-    }
-    if (_secondaryFont.italicVersion) {
-        if (_primaryFont.italicVersion) {
-            _secondaryFont.italicVersion.baselineOffset = _primaryFont.italicVersion.baselineOffset;
-        } else {
-            _secondaryFont.italicVersion.baselineOffset = _secondaryFont.baselineOffset;
-        }
-    }
 
     [self updateMarkedTextAttributes];
     [self setNeedsDisplay:YES];
@@ -726,9 +717,9 @@ static const int kDragThreshold = 3;
 
 - (void)changeFont:(id)fontManager
 {
-    if ([[[PreferencePanel sharedInstance] window] isVisible]) {
+    if ([[[PreferencePanel sharedInstance] windowIfLoaded] isVisible]) {
         [[PreferencePanel sharedInstance] changeFont:fontManager];
-    } else if ([[[PreferencePanel sessionsInstance] window] isVisible]) {
+    } else if ([[[PreferencePanel sessionsInstance] windowIfLoaded] isVisible]) {
         [[PreferencePanel sessionsInstance] changeFont:fontManager];
     }
 }
@@ -760,10 +751,10 @@ static const int kDragThreshold = 3;
 // This is 2 except for just after the frame has changed and things are resizing.
 - (double)excess {
     NSRect visible = [self scrollViewContentSize];
-    visible.size.height -= VMARGIN * 2;  // Height without top and bottom margins.
+    visible.size.height -= [iTermAdvancedSettingsModel terminalVMargin] * 2;  // Height without top and bottom margins.
     int rows = visible.size.height / _lineHeight;
     double usablePixels = rows * _lineHeight;
-    return MAX(visible.size.height - usablePixels + VMARGIN, VMARGIN);  // Never have less than VMARGIN excess, but it can be more (if another tab has a bigger font)
+    return MAX(visible.size.height - usablePixels + [iTermAdvancedSettingsModel terminalVMargin], [iTermAdvancedSettingsModel terminalVMargin]);  // Never have less than VMARGIN excess, but it can be more (if another tab has a bigger font)
 }
 
 - (CGFloat)desiredHeight {
@@ -779,7 +770,7 @@ static const int kDragThreshold = 3;
 }
 
 // This exists to work around an apparent OS bug described in issue 2690. Under some circumstances
-// (which I cannot reproduce) the key window will be an NSToolbarFullScreenWindow and the PTYWindow
+// (which I cannot reproduce) the key window will be an NSToolbarFullScreenWindow and the iTermTerminalWindow
 // will be one of the main windows. NSToolbarFullScreenWindow doesn't appear to handle keystrokes,
 // so they fall through to the main window. We'd like the cursor to blink and have other key-
 // window behaviors in this case.
@@ -815,7 +806,7 @@ static const int kDragThreshold = 3;
 - (BOOL)_isTextBlinking
 {
     int width = [_dataSource width];
-    int lineStart = ([self visibleRect].origin.y + VMARGIN) / _lineHeight;  // add VMARGIN because stuff under top margin isn't visible.
+    int lineStart = ([self visibleRect].origin.y + [iTermAdvancedSettingsModel terminalVMargin]) / _lineHeight;  // add VMARGIN because stuff under top margin isn't visible.
     int lineEnd = ceil(([self visibleRect].origin.y + [self visibleRect].size.height - [self excess]) / _lineHeight);
     if (lineStart < 0) {
         lineStart = 0;
@@ -919,7 +910,6 @@ static const int kDragThreshold = 3;
     int scrollbackOverflow = [_dataSource scrollbackOverflow];
     [_dataSource resetScrollbackOverflow];
     [_delegate textViewResizeFrameIfNeeded];
-
     // Perform adjustments if lines were lost from the head of the buffer.
     BOOL userScroll = [(PTYScroller*)([[self enclosingScrollView] verticalScroller]) userScroll];
     if (scrollbackOverflow > 0) {
@@ -947,6 +937,8 @@ static const int kDragThreshold = 3;
             [subview setNeedsDisplay:YES];
         }
     }
+
+    [_delegate textViewDidRefresh];
 
     // See if any characters are dirty and mark them as needing to be redrawn.
     // Return if anything was found to be blinking.
@@ -1019,7 +1011,7 @@ static const int kDragThreshold = 3;
 - (long long)absoluteScrollPosition
 {
     NSRect visibleRect = [self visibleRect];
-    long long localOffset = (visibleRect.origin.y + VMARGIN) / [self lineHeight];
+    long long localOffset = (visibleRect.origin.y + [iTermAdvancedSettingsModel terminalVMargin]) / [self lineHeight];
     return localOffset + [_dataSource totalScrollbackOverflow];
 }
 
@@ -1027,7 +1019,7 @@ static const int kDragThreshold = 3;
 {
     NSRect aFrame;
     aFrame.origin.x = 0;
-    aFrame.origin.y = (absOff - [_dataSource totalScrollbackOverflow]) * _lineHeight - VMARGIN;
+    aFrame.origin.y = (absOff - [_dataSource totalScrollbackOverflow]) * _lineHeight - [iTermAdvancedSettingsModel terminalVMargin];
     aFrame.size.width = [self frame].size.width;
     aFrame.size.height = _lineHeight * height;
     [self scrollRectToVisible: aFrame];
@@ -1040,7 +1032,7 @@ static const int kDragThreshold = 3;
         NSRect aFrame;
         VT100GridCoordRange range = [_selection spanningRange];
         aFrame.origin.x = 0;
-        aFrame.origin.y = range.start.y * _lineHeight - VMARGIN;  // allow for top margin
+        aFrame.origin.y = range.start.y * _lineHeight - [iTermAdvancedSettingsModel terminalVMargin];  // allow for top margin
         aFrame.size.width = [self frame].size.width;
         aFrame.size.height = (range.end.y - range.start.y + 1) * _lineHeight;
         [self scrollRectToVisible: aFrame];
@@ -1049,10 +1041,10 @@ static const int kDragThreshold = 3;
 }
 
 - (void)markCursorDirty {
-  int currentCursorX = [_dataSource cursorX] - 1;
-  int currentCursorY = [_dataSource cursorY] - 1;
+    int currentCursorX = [_dataSource cursorX] - 1;
+    int currentCursorY = [_dataSource cursorY] - 1;
     DLog(@"Mark cursor position %d, %d dirty.", currentCursorX, currentCursorY);
-  [_dataSource setCharDirtyAtCursorX:currentCursorX Y:currentCursorY];
+    [_dataSource setCharDirtyAtCursorX:currentCursorX Y:currentCursorY];
 }
 
 - (void)setCursorVisible:(BOOL)cursorVisible {
@@ -1064,10 +1056,18 @@ static const int kDragThreshold = 3;
     return _drawingHelper.cursorVisible;
 }
 
+- (CGFloat)minimumBaselineOffset {
+    return _primaryFont.baselineOffset;
+}
+
+- (CGFloat)minimumUnderlineOffset {
+    return _primaryFont.underlineOffset;
+}
+
 - (void)drawRect:(NSRect)rect {
     BOOL savedCursorVisible = _drawingHelper.cursorVisible;
 
-    // Try to use a saved grid if one is available. If it suceeds, that implies that the cursor was
+    // Try to use a saved grid if one is available. If it succeeds, that implies that the cursor was
     // recently hidden and what we're drawing is how the screen looked just before the cursor was
     // hidden. Therefore, we'll temporarily show the cursor, but we'll need to restore cursorVisible's
     // value when we're done.
@@ -1102,7 +1102,11 @@ static const int kDragThreshold = 3;
     _drawingHelper.drawMarkIndicators = [_delegate textViewShouldShowMarkIndicators];
     _drawingHelper.thinStrokes = _thinStrokes;
     _drawingHelper.showSearchingCursor = _showSearchingCursor;
-
+    _drawingHelper.baselineOffset = [self minimumBaselineOffset];
+    _drawingHelper.underlineOffset = [self minimumUnderlineOffset];
+    _drawingHelper.boldAllowed = _useBoldFont;
+    _drawingHelper.unicodeVersion = [_delegate textViewUnicodeVersion];
+    
     const NSRect *rectArray;
     NSInteger rectCount;
     [self getRectsBeingDrawn:&rectArray count:&rectCount];
@@ -1320,7 +1324,8 @@ static const int kDragThreshold = 3;
 // * Press L in AquaSKK's Hiragana to enter AquaSKK's ASCII
 // * "special" keys, like Enter which go through doCommandBySelector
 // * Repeated special keys
-- (void)keyDown:(NSEvent*)event {
+- (void)keyDown:(NSEvent *)event {
+    event = [event eventByChangingYenToBackslash];
     [_altScreenMouseScrollInferer keyDown:event];
     if (![_delegate textViewShouldAcceptKeyDownEvent:event]) {
         return;
@@ -1338,7 +1343,7 @@ static const int kDragThreshold = 3;
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        iTermApplicationDelegate *appDelegate = iTermApplication.sharedApplication.delegate;
+        iTermApplicationDelegate *appDelegate = [iTermApplication.sharedApplication delegate];
         [appDelegate userDidInteractWithASession];
     });
 
@@ -1491,6 +1496,10 @@ static const int kDragThreshold = 3;
     NSEvent *event = [NSApp currentEvent];
     return (([[self delegate] xtermMouseReporting]) &&        // Xterm mouse reporting is on
             !([event modifierFlags] & NSAlternateKeyMask));   // Not holding Opt to disable mouse reporting
+}
+
+- (BOOL)xtermMouseReportingAllowMouseWheel {
+    return [[self delegate] xtermMouseReportingAllowMouseWheel];
 }
 
 // If mouse reports are sent to the delegate, will it use them? Use with -xtermMouseReporting, which
@@ -1683,7 +1692,7 @@ static const int kDragThreshold = 3;
 }
 
 - (BOOL)hasUnderline {
-    return _drawingHelper.underlineRange.coordRange.start.x >= 0;
+    return _drawingHelper.underlinedRange.coordRange.start.x >= 0;
 }
 
 // Reset underlined chars indicating cmd-clicakble url.
@@ -1691,8 +1700,8 @@ static const int kDragThreshold = 3;
     if (![self hasUnderline]) {
         return;
     }
-    _drawingHelper.underlineRange =
-        VT100GridWindowedRangeMake(VT100GridCoordRangeMake(-1, -1, -1, -1), 0, 0);
+    _drawingHelper.underlinedRange =
+        VT100GridAbsWindowedRangeMake(VT100GridAbsCoordRangeMake(-1, -1, -1, -1), 0, 0);
     if (self.currentUnderlineHostname) {
         [[AsyncHostLookupController sharedInstance] cancelRequestForHostname:self.currentUnderlineHostname];
     }
@@ -1725,10 +1734,10 @@ static const int kDragThreshold = 3;
                                                          y:y
                                     respectingHardNewlines:![iTermAdvancedSettingsModel ignoreHardNewlinesInURLs]];
             if (action) {
-                _drawingHelper.underlineRange = action.range;
+                _drawingHelper.underlinedRange = VT100GridAbsWindowedRangeFromRelative(action.range, [_dataSource totalScrollbackOverflow]);
 
                 if (action.actionType == kURLActionOpenURL) {
-                    NSURL *url = [NSURL URLWithString:action.string];
+                    NSURL *url = [NSURL URLWithUserSuppliedString:action.string];
                     if (![url.host isEqualToString:self.currentUnderlineHostname]) {
                         if (self.currentUnderlineHostname) {
                             [[AsyncHostLookupController sharedInstance] cancelRequestForHostname:self.currentUnderlineHostname];
@@ -1876,7 +1885,7 @@ static const int kDragThreshold = 3;
 }
 
 - (NSPoint)pointForCoord:(VT100GridCoord)coord {
-    return NSMakePoint(MARGIN + coord.x * _charWidth,
+    return NSMakePoint([iTermAdvancedSettingsModel terminalMargin] + coord.x * _charWidth,
                        coord.y * _lineHeight);
 }
 
@@ -1894,7 +1903,7 @@ static const int kDragThreshold = 3;
     int x, y;
     int width = [_dataSource width];
 
-    x = (locationInTextView.x - MARGIN + _charWidth * kCharWidthFractionOffset) / _charWidth;
+    x = (locationInTextView.x - [iTermAdvancedSettingsModel terminalMargin] + _charWidth * kCharWidthFractionOffset) / _charWidth;
     if (x < 0) {
         x = 0;
     }
@@ -2502,14 +2511,14 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
             case kURLActionOpenExistingFile: {
                 NSString *extendedPrefix = [extractor wrappedStringAt:coord
                                                               forward:NO
-                                                  respectHardNewlines:NO
+                                                  respectHardNewlines:![iTermAdvancedSettingsModel ignoreHardNewlinesInURLs]
                                                              maxChars:[iTermAdvancedSettingsModel maxSemanticHistoryPrefixOrSuffix]
                                                     continuationChars:nil
                                                   convertNullsToSpace:YES
                                                                coords:nil];
                 NSString *extendedSuffix = [extractor wrappedStringAt:coord
                                                               forward:YES
-                                                  respectHardNewlines:NO
+                                                  respectHardNewlines:![iTermAdvancedSettingsModel ignoreHardNewlinesInURLs]
                                                              maxChars:[iTermAdvancedSettingsModel maxSemanticHistoryPrefixOrSuffix]
                                                     continuationChars:nil
                                                   convertNullsToSpace:YES
@@ -2523,7 +2532,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                 break;
             }
             case kURLActionOpenURL:
-                [self findUrlInString:action.string andOpenInBackground:openInBackground];
+                [self openURL:[NSURL URLWithUserSuppliedString:action.string] inBackground:openInBackground];
                 break;
 
             case kURLActionSmartSelectionAction: {
@@ -2590,14 +2599,6 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     [self smartSelectAtX:x y:y ignoringNewlines:NO];
 }
 
-- (void)smartSelectIgnoringNewlinesWithEvent:(NSEvent *)event {
-    NSPoint clickPoint = [self clickPoint:event allowRightMarginOverflow:NO];
-    int x = clickPoint.x;
-    int y = clickPoint.y;
-
-    [self smartSelectAtX:x y:y ignoringNewlines:YES];
-}
-
 - (void)smartSelectAndMaybeCopyWithEvent:(NSEvent *)event
                         ignoringNewlines:(BOOL)ignoringNewlines {
     NSPoint clickPoint = [self clickPoint:event allowRightMarginOverflow:NO];
@@ -2637,7 +2638,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     if (mark && mark.command.length) {
         markMenu = [self menuForMark:mark directory:[_dataSource workingDirectoryOnLine:y]];
         NSPoint locationInWindow = [event locationInWindow];
-        if (locationInWindow.x < MARGIN) {
+        if (locationInWindow.x < [iTermAdvancedSettingsModel terminalMargin]) {
             return markMenu;
         }
     }
@@ -2683,13 +2684,17 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         NSPoint clickPoint = [self clickPoint:event allowRightMarginOverflow:YES];
         [_selection beginExtendingSelectionAt:VT100GridCoordMake(clickPoint.x, clickPoint.y)];
         [_selection endLiveSelection];
+        if ([iTermPreferences boolForKey:kPreferenceKeySelectionCopiesText]) {
+            [self copySelectionAccordingToUserPreferences];
+        }
     }
 }
 
 - (void)showDefinitionForWordAt:(NSPoint)clickPoint {
     iTermTextExtractor *extractor = [iTermTextExtractor textExtractorWithDataSource:_dataSource];
     VT100GridWindowedRange range =
-        [extractor rangeForWordAt:VT100GridCoordMake(clickPoint.x, clickPoint.y)];
+        [extractor rangeForWordAt:VT100GridCoordMake(clickPoint.x, clickPoint.y)
+                    maximumLength:kReasonableMaximumWordLength];
     NSAttributedString *word = [extractor contentInRange:range
                                        attributeProvider:^NSDictionary *(screen_char_t theChar) {
                                            return [self charAttributes:theChar];
@@ -2699,6 +2704,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                       includeLastNewline:NO
                                   trimTrailingWhitespace:YES
                                             cappedAtSize:_dataSource.width
+                                            truncateTail:YES
                                        continuationChars:nil
                                                   coords:nil];
     if (word.length) {
@@ -2715,23 +2721,8 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 }
 
 - (BOOL)showWebkitPopoverAtPoint:(NSPoint)pointInWindow url:(NSURL *)url {
-    FutureWKWebViewConfiguration *configuration = [[[FutureWKWebViewConfiguration alloc] init] autorelease];
-    if (configuration) {
-        // If you get here, it's OS 10.10 or newer.
-        configuration.applicationNameForUserAgent = @"iTerm2";
-        FutureWKPreferences *prefs = [[[FutureWKPreferences alloc] init] autorelease];
-        prefs.javaEnabled = NO;
-        prefs.javaScriptEnabled = YES;
-        prefs.javaScriptCanOpenWindowsAutomatically = NO;
-        configuration.preferences = prefs;
-        configuration.processPool = [[[FutureWKProcessPool alloc] init] autorelease];
-        FutureWKUserContentController *userContentController =
-            [[[FutureWKUserContentController alloc] init] autorelease];
-        configuration.userContentController = userContentController;
-        configuration.websiteDataStore = [FutureWKWebsiteDataStore defaultDataStore];
-        FutureWKWebView *webView = [[[FutureWKWebView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600)
-                                                             configuration:configuration] autorelease];
-
+    WKWebView *webView = [[iTermWebViewPool sharedInstance] webView];
+    if (webView) {
         NSURLRequest *request =
             [[[NSURLRequest alloc] initWithURL:url] autorelease];
         [webView loadRequest:request];
@@ -2746,6 +2737,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                  _lineHeight);
         rect = [self convertRect:rect fromView:nil];
         popover.behavior = NSPopoverBehaviorSemitransient;
+        popover.delegate = self;
         [popover showRelativeToRect:rect
                              ofView:self
                       preferredEdge:NSRectEdgeMinY];
@@ -2778,7 +2770,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
             break;
 
         case kURLActionOpenURL: {
-            url = [NSURL URLWithString:urlAction.string];
+            url = [NSURL URLWithUserSuppliedString:urlAction.string];
             if (url && [self showWebkitPopoverAtPoint:event.locationInWindow url:url]) {
                 return;
             }
@@ -3018,9 +3010,10 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 - (IBAction)installShellIntegration:(id)sender {
     iTermWarning *warning = [[[iTermWarning alloc] init] autorelease];
     warning.title = @"Shell Integration comes with an optional Utilities Package, which lets you view images and download files. What would you prefer?";
-    warning.actions = @[ @"Install Shell Integration & Utilities", @"Cancel", @"Shell Integration Only" ];
+    warning.actionLabels = @[ @"Install Shell Integration & Utilities", @"Cancel", @"Shell Integration Only" ];
     warning.identifier = @"NoSyncInstallUtilitiesPackage";
     warning.warningType = kiTermWarningTypePermanentlySilenceable;
+    warning.cancelLabel = @"Cancel";
     warning.showHelpBlock = ^() {
         [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"https://iterm2.com/utilities.html"]];
     };
@@ -3039,10 +3032,26 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
             assert(false);
     }
     if (theCommand) {
-        [_delegate writeTask:theCommand];
+        [self installShellIntegrationWithCommand:theCommand];
     } else {
         assert(false);
     }
+}
+
+- (void)installShellIntegrationWithCommand:(NSString *)theCommand {
+    iTermWarning *warning = [[[iTermWarning alloc] init] autorelease];
+    warning.title = [NSString stringWithFormat:@"Ok to run this command in the current shell?\n\n%@", theCommand];
+    warning.warningActions =
+    @[
+          [iTermWarningAction warningActionWithLabel:@"OK" block:^(iTermWarningSelection selection) {
+              [_delegate writeTask:theCommand];
+          }],
+          [iTermWarningAction warningActionWithLabel:@"Cancel" block:nil]
+      ];
+    warning.identifier = @"NoSyncConfirmShellIntegrationCommand";
+    warning.warningType = kiTermWarningTypePermanentlySilenceable;
+    warning.cancelLabel = @"Cancel";
+    [warning runModal];
 }
 
 - (IBAction)selectAll:(id)sender
@@ -3167,6 +3176,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                 includeLastNewline:copyLastNewline
                             trimTrailingWhitespace:trimWhitespace
                                       cappedAtSize:cap
+                                      truncateTail:YES
                                  continuationChars:nil
                                             coords:nil];
             if (attributed) {
@@ -3224,6 +3234,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                   includeLastNewline:YES
               trimTrailingWhitespace:NO
                         cappedAtSize:-1
+                        truncateTail:YES
                    continuationChars:nil
                               coords:nil];
 }
@@ -3310,7 +3321,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     [name drawAtPoint:NSMakePoint(0, 0) withAttributes:attributes];
     [image unlockFocus];
 
-    NSRect windowRect = [self convertRect:NSMakeRect(range.start.x * _charWidth + MARGIN,
+    NSRect windowRect = [self convertRect:NSMakeRect(range.start.x * _charWidth + [iTermAdvancedSettingsModel terminalMargin],
                                                      range.start.y * _lineHeight,
                                                      0,
                                                      0)
@@ -3341,7 +3352,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                 (PTYNoteViewController *)noteView.delegate.noteViewController;
             VT100GridCoordRange coordRange = [_dataSource coordRangeOfNote:note];
             if (coordRange.end.y >= 0) {
-                [note setAnchor:NSMakePoint(coordRange.end.x * _charWidth + MARGIN,
+                [note setAnchor:NSMakePoint(coordRange.end.x * _charWidth + [iTermAdvancedSettingsModel terminalMargin],
                                             (1 + coordRange.end.y) * _lineHeight)];
             }
         }
@@ -3607,6 +3618,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     if ([item action] == @selector(saveImageAs:) ||
         [item action] == @selector(copyImage:) ||
         [item action] == @selector(openImage:) ||
+        [item action] == @selector(togglePauseAnimatingImage:) ||
         [item action] == @selector(inspectImage:)) {
         return YES;
     }
@@ -3655,25 +3667,32 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     }
 }
 
-- (BOOL)addCustomActionsToMenu:(NSMenu *)theMenu matchingText:(NSString *)textWindow line:(int)line
-{
+- (BOOL)addCustomActionsToMenu:(NSMenu *)theMenu matchingText:(NSString *)textWindow line:(int)line {
     BOOL didAdd = NO;
-    NSArray* rulesArray = _smartSelectionRules ? _smartSelectionRules : [SmartSelectionController defaultRules];
+    NSArray *rulesArray = _smartSelectionRules ? _smartSelectionRules : [SmartSelectionController defaultRules];
     const int numRules = [rulesArray count];
 
+    DLog(@"Looking for custom actions. Evaluating smart selection rules…");
+    DLog(@"text window is: %@", textWindow);
     for (int j = 0; j < numRules; j++) {
         NSDictionary *rule = [rulesArray objectAtIndex:j];
+        NSArray *actions = [SmartSelectionController actionsInRule:rule];
+        if (!actions.count) {
+            DLog(@"Skipping rule with no actions:\n%@", rule);
+            continue;
+        }
+        
+        DLog(@"Evaluating rule:\n%@", rule);
         NSString *regex = [SmartSelectionController regexInRule:rule];
         for (int i = 0; i <= textWindow.length; i++) {
-            NSString* substring = [textWindow substringWithRange:NSMakeRange(i, [textWindow length] - i)];
-            NSError* regexError = nil;
+            NSString *substring = [textWindow substringWithRange:NSMakeRange(i, [textWindow length] - i)];
+            NSError *regexError = nil;
             NSArray *components = [substring captureComponentsMatchedByRegex:regex
                                                                      options:0
                                                                        range:NSMakeRange(0, [substring length])
                                                                        error:&regexError];
             if (components.count) {
-                NSLog(@"Components for %@ are %@", regex, components);
-                NSArray *actions = [SmartSelectionController actionsInRule:rule];
+                DLog(@"Components for %@ are %@", regex, components);
                 for (NSDictionary *action in actions) {
                     SEL mySelector = [self selectorForSmartSelectionAction:action];
                     NSString *theTitle =
@@ -3710,7 +3729,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 
 - (void)contextMenuActionOpenURL:(id)sender
 {
-    NSURL *url = [NSURL URLWithString:[sender representedObject]];
+    NSURL *url = [NSURL URLWithUserSuppliedString:[sender representedObject]];
     if (url) {
         NSLog(@"Open URL: %@", [sender representedObject]);
         [[NSWorkspace sharedWorkspace] openURL:url];
@@ -3788,7 +3807,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         }
         case kPTYTextViewSelectionExtensionUnitWord: {
             VT100GridWindowedRange rangeWithWordBeforeStart =
-                [extractor rangeForWordAt:coordBeforeStart];
+                [extractor rangeForWordAt:coordBeforeStart maximumLength:kUnlimitedMaximumWordLength];
             rangeWithWordBeforeStart.coordRange.end = existingRange.coordRange.end;
             rangeWithWordBeforeStart.columnWindow = existingRange.columnWindow;
             return rangeWithWordBeforeStart;
@@ -3841,7 +3860,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
             BOOL startWasOnNull = [extractor characterAt:startCoord].code == 0;
             VT100GridWindowedRange rangeExcludingWordAtStart = existingRange;
             rangeExcludingWordAtStart.coordRange.start =
-            [extractor rangeForWordAt:startCoord].coordRange.end;
+            [extractor rangeForWordAt:startCoord  maximumLength:kUnlimitedMaximumWordLength].coordRange.end;
             // If the start of range moved from a null to a null, skip to the end of the line or past all the nulls.
             if (startWasOnNull &&
                 [extractor characterAt:rangeExcludingWordAtStart.coordRange.start].code == 0) {
@@ -3886,7 +3905,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         case kPTYTextViewSelectionExtensionUnitWord: {
             VT100GridWindowedRange rangeExcludingWordAtEnd = existingRange;
             rangeExcludingWordAtEnd.coordRange.end =
-            [extractor rangeForWordAt:coordBeforeEnd].coordRange.start;
+            [extractor rangeForWordAt:coordBeforeEnd maximumLength:kUnlimitedMaximumWordLength].coordRange.start;
             rangeExcludingWordAtEnd.columnWindow = existingRange.columnWindow;
             return rangeExcludingWordAtEnd;
         }
@@ -3934,9 +3953,9 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         case kPTYTextViewSelectionExtensionUnitWord: {
             VT100GridWindowedRange rangeWithWordAfterEnd;
             if (endCoord.x > VT100GridRangeMax(existingRange.columnWindow)) {
-                rangeWithWordAfterEnd = [extractor rangeForWordAt:coordAfterEnd];
+                rangeWithWordAfterEnd = [extractor rangeForWordAt:coordAfterEnd maximumLength:kUnlimitedMaximumWordLength];
             } else {
-                rangeWithWordAfterEnd = [extractor rangeForWordAt:endCoord];
+                rangeWithWordAfterEnd = [extractor rangeForWordAt:endCoord maximumLength:kUnlimitedMaximumWordLength];
             }
             rangeWithWordAfterEnd.coordRange.start = existingRange.coordRange.start;
             rangeWithWordAfterEnd.columnWindow = existingRange.columnWindow;
@@ -4199,7 +4218,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
             }
         }
         if (!data) {
-            NSBitmapImageRep *rep = [imageInfo.image bitmapImageRep];
+            NSBitmapImageRep *rep = [imageInfo.image.images.firstObject bitmapImageRep];
             data = [rep representationUsingType:fileType properties:@{}];
         }
         [data writeToFile:filename atomically:NO];
@@ -4242,6 +4261,18 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 
         [alert layout];
         [alert runModal];
+    }
+}
+
+- (void)togglePauseAnimatingImage:(id)sender {
+    iTermImageInfo *imageInfo = [sender representedObject];
+    if (imageInfo) {
+        imageInfo.paused = !imageInfo.paused;
+        if (!imageInfo.paused) {
+            // A redraw is needed to recompute which visible lines are animated
+            // and ensure they keep getting redrawn on a fast cadence.
+            [self setNeedsDisplay:YES];
+        }
     }
 }
 
@@ -4362,6 +4393,14 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                   @"selector": @"openImage:" },
                @{ @"title": @"Inspect",
                   @"selector": @"inspectImage:" } ];
+        if (imageInfo.animated || imageInfo.paused) {
+            NSString *selector = @"togglePauseAnimatingImage:";
+            if (imageInfo.paused) {
+                entryDicts = [entryDicts arrayByAddingObject:@{ @"title": @"Resume Animating", @"selector": selector }];
+            } else {
+                entryDicts = [entryDicts arrayByAddingObject:@{ @"title": @"Stop Animating", @"selector": selector }];
+            }
+        }
         for (NSDictionary *entryDict in entryDicts) {
             NSMenuItem *item;
 
@@ -4651,7 +4690,10 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     if ([types containsObject:NSFilenamesPboardType] && filenames.count && dropScpPath) {
         // This is all so the mouse cursor will change to a plain arrow instead of the
         // drop target cursor.
-        [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+        if (![[self window] isKindOfClass:[NSPanel class]]) {
+            // Can't do this to a floating panel or we switch away from the lion fullscreen app we're over.
+            [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+        }
         [[self window] makeKeyAndOrderFront:nil];
         [self performSelector:@selector(maybeUpload:)
                    withObject:@[ filenames, dropScpPath ]
@@ -4797,6 +4839,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                       includeLastNewline:YES
                                   trimTrailingWhitespace:NO
                                             cappedAtSize:-1
+                                            truncateTail:YES
                                        continuationChars:nil
                                                   coords:nil]];
             break;
@@ -5053,7 +5096,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     int y = [_dataSource cursorY] - 1;
     int x = [_dataSource cursorX] - 1;
 
-    NSRect rect=NSMakeRect(x * _charWidth + MARGIN,
+    NSRect rect=NSMakeRect(x * _charWidth + [iTermAdvancedSettingsModel terminalMargin],
                            (y + [_dataSource numberOfLines] - [_dataSource height] + 1) * _lineHeight,
                            _charWidth * theRange.length,
                            _lineHeight);
@@ -5224,8 +5267,8 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 
 - (void)setTransparency:(double)fVal {
     _transparency = fVal;
-    _drawingHelper.transparency = fVal;
     [self setNeedsDisplay:YES];
+    [_delegate textViewBackgroundColorDidChange];
 }
 
 - (void)setTransparencyAffectsOnlyDefaultBackgroundColor:(BOOL)value {
@@ -5346,7 +5389,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     int lineStart = [_dataSource numberOfLines] - [_dataSource height];
     int cursorX = [_dataSource cursorX] - 1;
     int cursorY = [_dataSource cursorY] - 1;
-    return NSMakeRect(MARGIN + cursorX * _charWidth,
+    return NSMakeRect([iTermAdvancedSettingsModel terminalMargin] + cursorX * _charWidth,
                       (lineStart + cursorY) * _lineHeight,
                       _charWidth,
                       _lineHeight);
@@ -5482,7 +5525,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     if (respectDividers) {
         [extractor restrictToLogicalWindowIncludingCoord:coord];
     }
-    VT100GridWindowedRange range = [extractor rangeForWordAt:coord];
+    VT100GridWindowedRange range = [extractor rangeForWordAt:coord  maximumLength:kUnlimitedMaximumWordLength];
     if (rangePtr) {
         *rangePtr = range;
     }
@@ -5494,6 +5537,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                   includeLastNewline:NO
               trimTrailingWhitespace:NO
                         cappedAtSize:-1
+                        truncateTail:YES
                    continuationChars:nil
                               coords:nil];
 }
@@ -5551,8 +5595,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 #pragma mark - Private methods
 
 // Compute the length, in _charWidth cells, of the input method text.
-- (int)inputMethodEditorLength
-{
+- (int)inputMethodEditorLength {
     if (![self hasMarkedText]) {
         return 0;
     }
@@ -5572,12 +5615,17 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                         [_delegate textViewAmbiguousWidthCharsAreDoubleWidth],
                         NULL,
                         NULL,
-                        [_delegate textViewUseHFSPlusMapping]);
+                        [_delegate textViewUseHFSPlusMapping],
+                        [_delegate textViewUnicodeVersion]);
 
     // Count how many additional cells are needed due to double-width chars
     // that span line breaks being wrapped to the next line.
     int x = [_dataSource cursorX] - 1;  // cursorX is 1-based
     int width = [_dataSource width];
+    if (width == 0 && len > 0) {
+        // Width should only be zero in weirdo edge cases, but the modulo below caused crashes.
+        return len;
+    }
     int extra = 0;
     int curX = x;
     for (int i = 0; i < len; ++i) {
@@ -5596,7 +5644,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 }
 
 - (void)useBackgroundIndicatorChanged:(NSNotification *)notification {
-    _showStripesWhenBroadcastingInput = iTermApplication.sharedApplication.delegate.useBackgroundPatternIndicator;
+    _showStripesWhenBroadcastingInput = [iTermApplication.sharedApplication delegate].useBackgroundPatternIndicator;
     [self setNeedsDisplay:YES];
 }
 
@@ -5612,7 +5660,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 
 - (void)_scrollToCenterLine:(int)line {
     NSRect visible = [self visibleRect];
-    int visibleLines = (visible.size.height - VMARGIN * 2) / _lineHeight;
+    int visibleLines = (visible.size.height - [iTermAdvancedSettingsModel terminalVMargin] * 2) / _lineHeight;
     int lineMargin = (visibleLines - 1) / 2;
     double margin = lineMargin * _lineHeight;
 
@@ -5635,7 +5683,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     p.y += rect.size.height;
     NSRect visibleRect = [[self enclosingScrollView] documentVisibleRect];
     visibleRect.size.height -= [self excess];
-    visibleRect.size.height -= VMARGIN;
+    visibleRect.size.height -= [iTermAdvancedSettingsModel terminalVMargin];
     p.y -= visibleRect.size.height;
     p.y = MAX(0, p.y);
     [[[self enclosingScrollView] contentView] scrollToPoint:p];
@@ -5906,7 +5954,6 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                         fromCharacterSet:[PTYTextView filenameCharacterSet]
                     charsTakenFromPrefix:NULL];
 
-    int fileCharsTaken = 0;
 
     NSString *workingDirectory = [_dataSource workingDirectoryOnLine:y];
     DLog(@"According to data source, the working directory on line %d is %@", y, workingDirectory);
@@ -5919,12 +5966,15 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     if (!workingDirectory) {
         workingDirectory = @"";
     }
+    int prefixChars = 0;
+    int suffixChars = 0;
     // First, try to locate an existing filename at this location.
     NSString *filename =
         [self.semanticHistoryController pathOfExistingFileFoundWithPrefix:possibleFilePart1
                                                                    suffix:possibleFilePart2
                                                          workingDirectory:workingDirectory
-                                                     charsTakenFromPrefix:&fileCharsTaken
+                                                     charsTakenFromPrefix:&prefixChars
+                                                     charsTakenFromSuffix:&suffixChars
                                                            trimWhitespace:NO];
 
     // Don't consider / to be a valid filename because it's useless and single/double slashes are
@@ -5936,17 +5986,17 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         URLAction *action = [URLAction urlActionToOpenExistingFile:filename];
         VT100GridWindowedRange range;
 
-        if (prefixCoords.count > 0 && fileCharsTaken > 0) {
-            NSInteger i = MAX(0, (NSInteger)prefixCoords.count - fileCharsTaken);
+        if (prefixCoords.count > 0 && prefixChars > 0) {
+            NSInteger i = MAX(0, (NSInteger)prefixCoords.count - prefixChars);
             range.coordRange.start = [prefixCoords[i] gridCoordValue];
         } else {
             // Everything is coming from the suffix (e.g., when mouse is on first char of filename)
             range.coordRange.start = [suffixCoords[0] gridCoordValue];
         }
         VT100GridCoord lastCoord;
-        NSInteger i = (NSInteger)filename.length - fileCharsTaken - 1;
         // Ensure we don't run off the end of suffixCoords if something unexpected happens.
-        i = MIN((NSInteger)suffixCoords.count - 1, i);
+        // Subtract 1 because the 0th index into suffixCoords corresponds to 1 suffix char being used, etc.
+        NSInteger i = MIN((NSInteger)suffixCoords.count - 1, suffixChars - 1);
         if (i >= 0) {
             lastCoord = [suffixCoords[i] gridCoordValue];
         } else {
@@ -6012,7 +6062,6 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     }
 
     // No luck. Look for something vaguely URL-like.
-    int prefixChars;
     NSString *joined = [prefix stringByAppendingString:suffix];
     DLog(@"Smart selection found nothing. Look for URL-like things in %@ around offset %d",
          joined, (int)[prefix length]);
@@ -6020,48 +6069,67 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                             fromCharacterSet:[PTYTextView urlCharacterSet]
                                         charsTakenFromPrefix:&prefixChars];
     DLog(@"String of just permissible chars is %@", possibleUrl);
-    NSString *originalMatch = possibleUrl;
 
-    NSRange urlRange = [possibleUrl rangeOfURLInString];
-    if (urlRange.location == NSNotFound) {
+    // Remove punctuation, parens, brackets, etc.
+    NSRange rangeWithoutNearbyPunctuation = [possibleUrl rangeOfURLInString];
+    if (rangeWithoutNearbyPunctuation.location == NSNotFound) {
         DLog(@"No URL found");
         return nil;
     }
-    NSString *subUrl = [possibleUrl substringWithRange:urlRange];
-    if ([subUrl rangeOfString:@":"].location == NSNotFound) {
-        NSString *defaultScheme = @"http://";
-        subUrl = [defaultScheme stringByAppendingString:subUrl];
-    }
-    DLog(@"URL in string is %@", subUrl);
+    NSString *stringWithoutNearbyPunctuation = [possibleUrl substringWithRange:rangeWithoutNearbyPunctuation];
+    DLog(@"String without nearby punctuation: %@", stringWithoutNearbyPunctuation);
 
-    // If subUrl contains a :, make sure something can handle that scheme.
-    NSURL *url = [NSURL URLWithString:subUrl];
-    BOOL openable = (url && [[NSWorkspace sharedWorkspace] URLForApplicationToOpenURL:url] != nil);
-    DLog(@"There seems to be a scheme. ruledOut=%d", (int)openable);
-
-    VT100GridWindowedRange range;
-    range.coordRange.start = [extractor coord:coord
-                                         plus:-(prefixChars - urlRange.location)
-                               skippingCoords:continuationCharsCoords
-                                      forward:NO];
-    range.coordRange.end = [extractor coord:range.coordRange.start
-                                       plus:urlRange.length
-                             skippingCoords:continuationCharsCoords
-                                    forward:YES];
-    range.columnWindow = extractor.logicalWindow;
-
-    if ([self stringLooksLikeURL:[originalMatch substringWithRange:urlRange]] &&
-         openable) {
-        DLog(@"%@ looks like a URL and it's not ruled out based on scheme. Go for it.",
-             [originalMatch substringWithRange:urlRange]);
-        URLAction *action = [URLAction urlActionToOpenURL:subUrl];
-        action.range = range;
-        return action;
+    const BOOL hasColon = ([stringWithoutNearbyPunctuation rangeOfString:@":"].location != NSNotFound);
+    BOOL looksLikeURL;
+    if (hasColon) {
+        // The test later on for whether an app exists to open the URL is sufficient.
+        DLog(@"Contains a colon so it looks like a URL to me");
+        looksLikeURL = YES;
     } else {
-        DLog(@"%@ is either not plausibly a URL or was ruled out based on scheme. Fail.",
-             [originalMatch substringWithRange:urlRange]);
+        // Only try to use HTTP if the string has something especially HTTP URL-like about it, such as
+        // containing a slash. This helps reduce the number of random strings that are misinterpreted
+        // as URLs.
+        looksLikeURL = [self stringLooksLikeURL:[possibleUrl substringWithRange:rangeWithoutNearbyPunctuation]];
+
+        if (looksLikeURL) {
+            DLog(@"There's no colon but it seems like it could be an HTTP URL. Let's give that a try.");
+            NSString *defaultScheme = @"http://";
+            stringWithoutNearbyPunctuation = [defaultScheme stringByAppendingString:stringWithoutNearbyPunctuation];
+        } else {
+            DLog(@"Doesn't look enough like a URL to guess that it's an HTTP URL");
+        }
     }
 
+    if (looksLikeURL) {
+        // If the string contains non-ascii characters, percent escape them. URLs are limited to ASCII.
+        NSURL *url = [NSURL URLWithUserSuppliedString:stringWithoutNearbyPunctuation];
+
+        // If something can handle the scheme then we're all set.
+        BOOL openable = (url && [[NSWorkspace sharedWorkspace] URLForApplicationToOpenURL:url] != nil);
+
+        if (openable) {
+            DLog(@"%@ is openable", url);
+            VT100GridWindowedRange range;
+            range.coordRange.start = [extractor coord:coord
+                                                 plus:-(prefixChars - rangeWithoutNearbyPunctuation.location)
+                                       skippingCoords:continuationCharsCoords
+                                              forward:NO];
+            range.coordRange.end = [extractor coord:range.coordRange.start
+                                               plus:rangeWithoutNearbyPunctuation.length
+                                     skippingCoords:continuationCharsCoords
+                                            forward:YES];
+            range.columnWindow = extractor.logicalWindow;
+            URLAction *action = [URLAction urlActionToOpenURL:stringWithoutNearbyPunctuation];
+            action.range = range;
+            return action;
+        } else {
+            DLog(@"%@ is not openable (couldn't convert it to a URL [%@] or no scheme handler",
+                 stringWithoutNearbyPunctuation, url);
+        }
+    }
+
+    // TODO: We usually don't get here because "foo.txt" looks enough like a URL that we do a DNS
+    // lookup and fail. It'd be nice to fallback to an SCP file path.
     // See if we can conjure up a secure copy path.
     smartMatch = [self smartSelectAtX:x
                                     y:y
@@ -6074,7 +6142,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                                 onLine:y];
         if (scpPath) {
             URLAction *action = [URLAction urlActionToSecureCopyFile:scpPath];
-            action.range = range;
+            action.range = smartRange;
             return action;
         }
     }
@@ -6086,8 +6154,8 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     if ([[notification object] isEqualToString:self.currentUnderlineHostname]) {
         self.currentUnderlineHostname = nil;
         [self removeUnderline];
-        _drawingHelper.underlineRange =
-            VT100GridWindowedRangeMake(VT100GridCoordRangeMake(-1, -1, -1, -1), 0, 0);
+        _drawingHelper.underlinedRange =
+            VT100GridAbsWindowedRangeMake(VT100GridAbsCoordRangeMake(-1, -1, -1, -1), 0, 0);
         [self setNeedsDisplay:YES];
     }
 }
@@ -6097,6 +6165,30 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         self.currentUnderlineHostname = nil;
         [self setNeedsDisplay:YES];
     }
+}
+
+- (void)imageDidLoad:(NSNotification *)notification {
+    if ([self imageIsVisible:notification.object]) {
+        [self setNeedsDisplay:YES];
+    }
+}
+
+- (BOOL)imageIsVisible:(iTermImageInfo *)image {
+    if (![_drawingHelper.missingImages containsObject:image.uniqueIdentifier]) {
+        return NO;
+    }
+    
+    int firstVisibleLine = [[self enclosingScrollView] documentVisibleRect].origin.y / _lineHeight;
+    int width = [_dataSource width];
+    for (int y = 0; y < [_dataSource height]; y++) {
+        screen_char_t *theLine = [_dataSource getLineAtIndex:y + firstVisibleLine];
+        for (int x = 0; x < width; x++) {
+            if (theLine && theLine[x].image && GetImageInfo(theLine[x].code) == image) {
+                return YES;
+            }
+        }
+    }
+    return NO;
 }
 
 - (URLAction *)urlActionForClickAtX:(int)x y:(int)y {
@@ -6168,13 +6260,16 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     }
 }
 
-// Opens a URL in the default browser in background or foreground
-// Don't call this unless you know that iTerm2 is NOT the handler for this scheme!
-- (void)openURL:(NSURL *)url inBackground:(BOOL)background
-{
-    if (background) {
-        NSArray* urls = [NSArray arrayWithObject:url];
-        [[NSWorkspace sharedWorkspace] openURLs:urls
+// If iTerm2 is the handler for the scheme, then the profile is launched directly.
+// Otherwise it's passed to the OS to launch.
+- (void)openURL:(NSURL *)url inBackground:(BOOL)background {
+    DLog(@"openURL:%@ inBackground:%@", url, @(background));
+
+    Profile *profile = [[iTermLaunchServices sharedInstance] profileForScheme:[url scheme]];
+    if (profile) {
+        [_delegate launchProfileInCurrentTerminal:profile withURL:url.absoluteString];
+    } else if (background) {
+        [[NSWorkspace sharedWorkspace] openURLs:@[ url ]
                                            withAppBundleIdentifier:nil
                                            options:NSWorkspaceLaunchWithoutActivation
                                            additionalEventParamDescriptor:nil
@@ -6184,8 +6279,6 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     }
 }
 
-// If iTerm2 is the handler for the scheme, then the bookmark is launched directly.
-// Otherwise it's passed to the OS to launch.
 - (void)findUrlInString:(NSString *)aURLString andOpenInBackground:(BOOL)background {
     DLog(@"findUrlInString:%@", aURLString);
     NSRange range = [aURLString rangeOfURLInString];
@@ -6201,15 +6294,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     NSString* escapedString = [trimmedURLString stringByEscapingForURL];
 
     NSURL *url = [NSURL URLWithString:escapedString];
-    DLog(@"Escaped string is %@", url);
-    Profile *profile = [[iTermLaunchServices sharedInstance] profileForScheme:[url scheme]];
-
-    if (profile) {
-        [_delegate launchProfileInCurrentTerminal:profile withURL:trimmedURLString];
-    } else {
-        [self openURL:url inBackground:background];
-    }
-
+    [self openURL:url inBackground:background];
 }
 
 - (void)_dragImage:(iTermImageInfo *)imageInfo forEvent:(NSEvent *)theEvent
@@ -6227,7 +6312,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     // drag from center of the image
     NSPoint dragPoint = [self convertPoint:[theEvent locationInWindow] fromView:nil];
 
-    VT100GridCoord coord = VT100GridCoordMake((dragPoint.x - MARGIN) / _charWidth,
+    VT100GridCoord coord = VT100GridCoordMake((dragPoint.x - [iTermAdvancedSettingsModel terminalMargin]) / _charWidth,
                                               dragPoint.y / _lineHeight);
     screen_char_t* theLine = [_dataSource getLineAtIndex:coord.y];
     if (theLine &&
@@ -6242,7 +6327,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
                                                             coord.y - pos.y);
 
         // Compute the pixel coordinate of the image's top left point
-        NSPoint imageTopLeftPoint = NSMakePoint(imageCellOrigin.x * _charWidth + MARGIN,
+        NSPoint imageTopLeftPoint = NSMakePoint(imageCellOrigin.x * _charWidth + [iTermAdvancedSettingsModel terminalMargin],
                                                 imageCellOrigin.y * _lineHeight);
 
         // Compute the distance from the click location to the image's origin
@@ -6357,11 +6442,11 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 - (void)setNeedsDisplayOnLine:(int)y inRange:(VT100GridRange)range {
     NSRect dirtyRect;
     const int x = range.location;
-    const int maxX = range.location + range.length - 1;
+    const int maxX = range.location + range.length;
 
-    dirtyRect.origin.x = MARGIN + x * _charWidth;
+    dirtyRect.origin.x = [iTermAdvancedSettingsModel terminalMargin] + x * _charWidth;
     dirtyRect.origin.y = y * _lineHeight;
-    dirtyRect.size.width = (maxX - x + 1) * _charWidth;
+    dirtyRect.size.width = (maxX - x) * _charWidth;
     dirtyRect.size.height = _lineHeight;
 
     if (_drawingHelper.showTimestamps) {
@@ -6371,7 +6456,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     // Expand the rect in case we're drawing a changed cell with an oversize glyph.
     dirtyRect = [self rectWithHalo:dirtyRect];
 
-    DLog(@"Line %d is dirty from %d to %d, set rect %@ dirty",
+    DLog(@"Line %d is dirty in range [%d, %d), set rect %@ dirty",
          y, x, maxX, [NSValue valueWithRect:dirtyRect]);
     [self setNeedsDisplayInRect:dirtyRect];
 }
@@ -6506,7 +6591,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     }
     int imeLines = ([_dataSource cursorX] - 1 + [self inputMethodEditorLength] + 1) / [_dataSource width] + 1;
 
-    NSRect imeRect = NSMakeRect(MARGIN,
+    NSRect imeRect = NSMakeRect([iTermAdvancedSettingsModel terminalMargin],
                                 ([_dataSource cursorY] - 1 + [_dataSource numberOfLines] - [_dataSource height]) * _lineHeight,
                                 [_dataSource width] * _charWidth,
                                 imeLines * _lineHeight);
@@ -6515,9 +6600,10 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 }
 
 - (NSRect)rectWithHalo:(NSRect)rect {
-    rect.origin.x -= _charWidth;
+    const int kHaloWidth = 4;
+    rect.origin.x = rect.origin.x - _charWidth * kHaloWidth;
     rect.origin.y -= _lineHeight;
-    rect.size.width += _charWidth * 2;
+    rect.size.width = self.frame.size.width + _charWidth * 2 * kHaloWidth;
     rect.size.height += _lineHeight * 2;
 
     return rect;
@@ -6531,7 +6617,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         int width = [_dataSource width];
         if (locationInTextView.y == 0) {
             x = y = 0;
-        } else if (locationInTextView.x < MARGIN && _selection.liveRange.coordRange.start.y < y) {
+        } else if (locationInTextView.x < [iTermAdvancedSettingsModel terminalMargin] && _selection.liveRange.coordRange.start.y < y) {
             // complete selection of previous line
             x = width;
             y--;
@@ -6562,7 +6648,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     BOOL anyBlinkers = NO;
     // Visible chars that have changed selection status are dirty
     // Also mark blinking text as dirty if needed
-    int lineStart = ([self visibleRect].origin.y + VMARGIN) / _lineHeight;  // add VMARGIN because stuff under top margin isn't visible.
+    int lineStart = ([self visibleRect].origin.y + [iTermAdvancedSettingsModel terminalVMargin]) / _lineHeight;  // add VMARGIN because stuff under top margin isn't visible.
     int lineEnd = ceil(([self visibleRect].origin.y + [self visibleRect].size.height - [self excess]) / _lineHeight);
     if (lineStart < 0) {
         lineStart = 0;
@@ -6715,6 +6801,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         [self updateScrollerForBackgroundColor];
         [[self enclosingScrollView] setBackgroundColor:[colorMap colorForKey:theKey]];
         [self recomputeBadgeLabel];
+        [_delegate textViewBackgroundColorDidChange];
     } else if (theKey == kColorMapForeground) {
         [self recomputeBadgeLabel];
     } else if (theKey == kColorMapSelection) {
@@ -6748,7 +6835,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     int height = [_dataSource height];
     rect.origin.y = numLines - height;
     rect.origin.y *= _lineHeight;
-    rect.origin.x = MARGIN;
+    rect.origin.x = [iTermAdvancedSettingsModel terminalMargin];
     rect.size.width = _charWidth * [_dataSource width];
     rect.size.height = _lineHeight * [_dataSource height];
     return rect;
@@ -6763,7 +6850,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
         return NO;
     }
     if (event.type == NSScrollWheel) {
-        return [self xtermMouseReporting];
+        return ([self xtermMouseReporting] && [self xtermMouseReportingAllowMouseWheel]);
     } else {
         PTYTextView* frontTextView = [[iTermController sharedInstance] frontTextView];
         return (frontTextView == self && [self xtermMouseReporting]);
@@ -7084,7 +7171,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
     NSRect windowRect = [self.window convertRectFromScreen:screenRect];
     NSPoint locationInTextView = [self convertPoint:windowRect.origin fromView:nil];
     NSRect visibleRect = [[self enclosingScrollView] documentVisibleRect];
-    int x = (locationInTextView.x - MARGIN - visibleRect.origin.x) / _charWidth;
+    int x = (locationInTextView.x - [iTermAdvancedSettingsModel terminalMargin] - visibleRect.origin.x) / _charWidth;
     int y = locationInTextView.y / _lineHeight;
     return VT100GridCoordMake(x, [self accessibilityHelperAccessibilityLineNumberForLineNumber:y]);
 }
@@ -7092,7 +7179,7 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 - (NSRect)accessibilityHelperFrameForCoordRange:(VT100GridCoordRange)coordRange {
     coordRange.start.y = [self accessibilityHelperLineNumberForAccessibilityLineNumber:coordRange.start.y];
     coordRange.end.y = [self accessibilityHelperLineNumberForAccessibilityLineNumber:coordRange.end.y];
-    NSRect result = NSMakeRect(MAX(0, floor(coordRange.start.x * _charWidth + MARGIN)),
+    NSRect result = NSMakeRect(MAX(0, floor(coordRange.start.x * _charWidth + [iTermAdvancedSettingsModel terminalMargin])),
                                MAX(0, coordRange.start.y * _lineHeight),
                                MAX(0, (coordRange.end.x - coordRange.start.x) * _charWidth),
                                MAX(0, (coordRange.end.y - coordRange.start.y + 1) * _lineHeight));
@@ -7178,6 +7265,15 @@ static double EuclideanDistance(NSPoint p1, NSPoint p2) {
 
 - (void)altScreenMouseScrollInfererDidInferScrollingIntent:(BOOL)isTrying {
     [_delegate textViewThinksUserIsTryingToSendArrowKeysWithScrollWheel:isTrying];
+}
+
+#pragma mark - NSPopoverDelegate
+
+- (void)popoverDidClose:(NSNotification *)notification {
+    NSPopover *popover = notification.object;
+    iTermWebViewWrapperViewController *viewController = (iTermWebViewWrapperViewController *)popover.contentViewController;
+    [viewController terminateWebView];
+
 }
 
 @end
