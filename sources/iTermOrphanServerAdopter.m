@@ -99,11 +99,11 @@
         [[iTermController sharedInstance] launchBookmark:nil
                                               inTerminal:desiredWindow
                                                  withURL:nil
-                                                isHotkey:NO
+                                        hotkeyWindowType:iTermHotkeyWindowTypeNone
                                                  makeKey:NO
                                              canActivate:NO
                                                  command:nil
-                                                   block:^PTYSession *(PseudoTerminal *term) {
+                                                   block:^PTYSession *(Profile *profile, PseudoTerminal *term) {
                                                        iTermFileDescriptorServerConnection theServerConnection = serverConnection;
                                                        term.disablePromptForSubstitutions = YES;
                                                        return [term createSessionWithProfile:defaultProfile

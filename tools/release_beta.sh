@@ -4,6 +4,11 @@ function die {
   exit
 }
 
+if [ $# -ne 1 ]; then
+   echo "Usage: release_beta.sh version"
+   exit 1
+fi
+
 test -f "$PRIVKEY" || die "Set PRIVKEY environment variable to point at a valid private key (not set or nonexistent)"
 # Usage: SparkleSign testing.xml template.xml
 function SparkleSign {
@@ -31,16 +36,18 @@ function SparkleSign {
 # Fifth arg is a prefix for sparkle files.
 # Sixth arg is extra args for codesign
 function Build {
+  pushd build/$BUILDTYPE/iTerm2.app/Contents/MacOS
+  echo Making link
+  ln -s iTerm2 iTerm
+  ls -l
+  popd
+
   BUILDTYPE=$1
   NAME=$(echo $VERSION | sed -e "s/\\./_/g")$2
   SUMMARY=$3
   DESCRIPTION=$4
   SPARKLE_PREFIX=$5
-  codesign -s "Developer ID Application: GEORGE NACHMAN" -f "build/$BUILDTYPE/iTerm2.app/Contents/Frameworks/Growl.framework"
-  codesign -s "Developer ID Application: GEORGE NACHMAN" -f "build/$BUILDTYPE/iTerm2.app/Contents/Frameworks/NMSSH.framework"
-  codesign -s "Developer ID Application: GEORGE NACHMAN" -f "build/$BUILDTYPE/iTerm2.app/Contents/Frameworks/Sparkle.framework"
-  codesign -s "Developer ID Application: GEORGE NACHMAN" -f "build/$BUILDTYPE/iTerm2.app/Contents/Frameworks/ColorPicker.framework"
-  codesign -s "Developer ID Application: GEORGE NACHMAN" -f "build/$BUILDTYPE/iTerm2.app"
+  /usr/bin/codesign --force --sign 3E1298F974EB540E3D1D905AA99612231919845E --requirements '=designated => anchor apple generic  and identifier "$self.identifier" and ((cert leaf[field.1.2.840.113635.100.6.1.9] exists) or ( certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists  and certificate leaf[subject.OU] = "H7V7XYVQ7D" ))' --timestamp=none "build/$BUILDTYPE/iTerm2.app"
   codesign --verify --verbose "build/$BUILDTYPE/iTerm2.app" || die "Signature not verified"
   pushd "build/$BUILDTYPE"
  
@@ -49,10 +56,11 @@ function Build {
   # since Sparkle won't accept a name change.
   rm -rf iTerm.app
   mv iTerm2.app iTerm.app
+
   zip -ry iTerm2-${NAME}.zip iTerm.app
  
   # Update the list of changes
-  vi $SVNDIR/source/appcasts/testing_changes.txt
+  vi $SVNDIR/source/appcasts/testing_changes3.txt
  
   # Place files in website git.
   cp iTerm2-${NAME}.zip $SVNDIR/downloads/beta/
@@ -64,28 +72,34 @@ function Build {
   shasum -a256 iTerm2-${NAME}.zip | awk '{print $1}' >> $SVNDIR/downloads/beta/iTerm2-${NAME}.changelog
   vi $SVNDIR/downloads/beta/iTerm2-${NAME}.changelog
   pushd $SVNDIR
-  git add downloads/beta/iTerm2-${NAME}.summary downloads/beta/iTerm2-${NAME}.description downloads/beta/iTerm2-${NAME}.changelog downloads/beta/iTerm2-${NAME}.zip source/appcasts/testing.xml source/appcasts/testing_changes.txt
+  git add downloads/beta/iTerm2-${NAME}.summary downloads/beta/iTerm2-${NAME}.description downloads/beta/iTerm2-${NAME}.changelog downloads/beta/iTerm2-${NAME}.zip source/appcasts/testing3.xml source/appcasts/testing_changes3.txt
   popd
 
   # Prepare the sparkle xml file
-  SparkleSign ${SPARKLE_PREFIX}testing.xml ${SPARKLE_PREFIX}template.xml
+  SparkleSign ${SPARKLE_PREFIX}testing3.xml ${SPARKLE_PREFIX}template3.xml
 
   popd
 }
+
+echo "$1" > version.txt
+echo Set version to
+cat version.txt
 
 COMPACTDATE=$(date +"%Y%m%d")
 VERSION=$(cat version.txt | sed -e "s/%(extra)s/$COMPACTDATE/")
 SVNDIR=~/iterm2-website
 ORIG_DIR=`pwd`
 
+
 echo "Build deployment release"
 make clean
 make release
-Build Deployment "" "OS 10.8+" "This is the recommended beta build for most users. It contains a bunch of bug fixes, including fixes for some crashers." "" "--deep"
 
-echo Update the linky in the version3 release notes page
-sleep 2
-vi ~/iterm2-website/source/version3.md
+BUILDTYPE=Deployment
+
+Build $BUILDTYPE "" "OS 10.8+" "This is the recommended beta build for most users. It contains a bunch of bug fixes, including fixes for some crashers." "" "--deep"
+
+git checkout -- version.txt
 #set -x
 
 git tag v${VERSION}

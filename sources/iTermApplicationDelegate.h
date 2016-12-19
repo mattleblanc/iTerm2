@@ -30,8 +30,8 @@
 #import "DebugLogging.h"
 #import "iTermApplication.h"
 
-@class PTYSession;
 @class PseudoTerminal;
+@class PTYSession;
 
 extern NSString *kUseBackgroundPatternIndicatorChangedNotification;
 extern NSString *const kSavedArrangementDidChangeNotification;
@@ -40,10 +40,11 @@ extern NSString *const kNonTerminalWindowBecameKeyNotification;
 extern NSString *const kMarkAlertActionModalAlert;
 extern NSString *const kMarkAlertActionPostNotification;
 extern NSString *const kShowFullscreenTabsSettingDidChange;
+extern NSString *const iTermApplicationWillTerminate;
 
 int DebugLogImpl(const char *file, int line, const char *function, NSString* value);
 
-@interface iTermApplicationDelegate : NSObject<NSApplicationDelegate>
+@interface iTermApplicationDelegate : NSObject<iTermApplicationDelegate>
 
 @property(nonatomic, readonly) BOOL workspaceSessionActive;
 @property(nonatomic, readonly) BOOL isApplescriptTestApp;

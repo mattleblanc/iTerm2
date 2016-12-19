@@ -44,7 +44,7 @@ static BOOL gWaitingForFullScreen;
 + (void)runQueuedBlocks_10_10_andEarlier {
     DLog(@"runQueuedBlocks (<=10.10) starting");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0),
-                   dispatch_get_current_queue(),
+                   dispatch_get_main_queue(),
                    ^{
                        for (VoidBlock block in queuedBlocks) {
                            block();
@@ -100,7 +100,7 @@ static BOOL gWaitingForFullScreen;
     if ([iTermPreferences boolForKey:kPreferenceKeyOpenArrangementAtStartup]) {
         DLog(@"Abort because opening arrangement at startup");
         NSDictionary *arrangement =
-            [state decodeObjectForKey:kPseudoTerminalStateRestorationWindowArrangementKey];
+            [state decodeObjectForKey:kTerminalWindowStateRestorationWindowArrangementKey];
         if (arrangement) {
             [PseudoTerminal registerSessionsInArrangement:arrangement];
         }
@@ -120,13 +120,14 @@ static BOOL gWaitingForFullScreen;
                                                      name:kApplicationDidFinishLaunchingNotification
                                                    object:nil];
     }
-    NSDictionary *arrangement = [state decodeObjectForKey:kPseudoTerminalStateRestorationWindowArrangementKey];
+    NSDictionary *arrangement = [state decodeObjectForKey:kTerminalWindowStateRestorationWindowArrangementKey];
     if (arrangement) {
         DLog(@"Have an arrangement");
         VoidBlock theBlock = ^{
             DLog(@"PseudoTerminalRestorer block running for id %@", identifier);
             DLog(@"Creating term");
-            PseudoTerminal *term = [PseudoTerminal bareTerminalWithArrangement:arrangement];
+            PseudoTerminal *term = [PseudoTerminal bareTerminalWithArrangement:arrangement
+                                                      forceOpeningHotKeyWindow:NO];
             DLog(@"Create a new terminal %@", term);
             if (!term) {
                 DLog(@"Failed to create term");
@@ -151,12 +152,23 @@ static BOOL gWaitingForFullScreen;
                                withObject:nil
                                afterDelay:0];
                     break;
+                    
+                case WINDOW_TYPE_LEFT:
+                case WINDOW_TYPE_RIGHT:
+                case WINDOW_TYPE_NORMAL:
+                case WINDOW_TYPE_LEFT_PARTIAL:
+                case WINDOW_TYPE_NO_TITLE_BAR:
+                case WINDOW_TYPE_RIGHT_PARTIAL:
+                case WINDOW_TYPE_LION_FULL_SCREEN:
+                    break;
             }
 
             DLog(@"Invoking completion handler");
             if (![self useElCapitanFullScreenLogic] || !term.togglingLionFullScreen) {
                 // In 10.10 or earlier, or 10.11 and a nonfullscreen window.
+                term.restoringWindow = YES;
                 completionHandler([term window], nil);
+                term.restoringWindow = NO;
                 DLog(@"Registering terminal window");
                 [[iTermController sharedInstance] addTerminalWindow:term];
             } else {
@@ -170,7 +182,9 @@ static BOOL gWaitingForFullScreen;
                     // Finished entering fullscreen. Run the completion handler
                     // and open more windows.
                     DLog(@"%@ finished entering fullscreen, running completion handler", theTerm);
+                    term.restoringWindow = YES;
                     completionHandler([theTerm window], nil);
+                    term.restoringWindow = NO;
                     [completionHandler release];
                     DLog(@"Registering terminal window");
                     [[iTermController sharedInstance] addTerminalWindow:term];

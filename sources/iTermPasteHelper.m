@@ -160,7 +160,7 @@ const int kNumberOfSpacesPerTabNoConversion = -1;
         NSString *replacement = nil;
         @try {
             replacement = [theString stringByReplacingOccurrencesOfRegex:pasteEvent.regex ?: @""
-                                                              withString:pasteEvent.substitution ?: @""] ?: @"";
+                                                              withString:[pasteEvent.substitution stringByExpandingVimSpecialCharacters] ?: @""] ?: @"";
             if (replacement) {
                 theString = replacement;
             }
@@ -394,6 +394,7 @@ const int kNumberOfSpacesPerTabNoConversion = -1;
                 block = YES;
             }
         }
+        range = [_buffer makeRangeSafe:range];
         [_delegate pasteHelperWriteString:[_buffer substringWithRange:range]];
     }
     [_buffer replaceCharactersInRange:range withString:@""];
@@ -484,58 +485,60 @@ const int kNumberOfSpacesPerTabNoConversion = -1;
     }
     NSArray *lines = [pasteEvent.string componentsSeparatedByRegex:@"(?:\r\n)|(?:\r)|(?:\n)"];
     NSString *theTitle;
-    NSMutableArray *actions = [NSMutableArray array];
-    [actions addObject:@"Paste"];
-    [actions addObject:@"Cancel"];
+    NSMutableArray<iTermWarningAction *> *actions = [NSMutableArray array];
+    
+    __block BOOL result = YES;
+    iTermWarningAction *cancel = [iTermWarningAction warningActionWithLabel:@"Cancel"
+                                                                      block:^(iTermWarningSelection selection) { result = NO; }];
+    iTermWarningAction *paste = [iTermWarningAction warningActionWithLabel:@"Paste"
+                                                                     block:^(iTermWarningSelection selection) { result = YES; }];
+    iTermWarningAction *pasteWithoutNewline =
+        [iTermWarningAction warningActionWithLabel:@"Paste Without Newline"
+                                             block:^(iTermWarningSelection selection) {
+                                                 NSCharacterSet *newlines = [NSCharacterSet newlineCharacterSet];
+                                                 pasteEvent.string =
+                                                     [pasteEvent.string stringByTrimmingTrailingCharactersFromCharacterSet:newlines];
+                                                 result = YES;
+                                             }];
+    
+    [actions addObject:paste];
+    [actions addObject:cancel];
     NSString *identifier = [iTermAdvancedSettingsModel noSyncDoNotWarnBeforeMultilinePasteUserDefaultsKey];
+    BOOL prompt = YES;
     if (lines.count > 1) {
         if (atShellPrompt) {
             theTitle = [NSString stringWithFormat:@"OK to paste %d lines at shell prompt?",
                         (int)[lines count]];
         } else {
+            prompt = [iTermAdvancedSettingsModel promptForPasteWhenNotAtPrompt];
             theTitle = [NSString stringWithFormat:@"OK to paste %d lines?",
                         (int)[lines count]];
         }
     } else {
+        [actions insertObject:pasteWithoutNewline atIndex:1];
         if (atShellPrompt) {
-            [actions insertObject:@"Paste Without Newline" atIndex:1];
             identifier = [iTermAdvancedSettingsModel noSyncDoNotWarnBeforePastingOneLineEndingInNewlineAtShellPromptUserDefaultsKey];
             theTitle = @"OK to paste one line ending in a newline at shell prompt?";
         } else {
+            prompt = [iTermAdvancedSettingsModel promptForPasteWhenNotAtPrompt];
             theTitle = @"OK to paste one line ending in a newline?";
         }
     }
-    iTermWarningSelection selection =
-        [iTermWarning showWarningWithTitle:theTitle
-                                   actions:actions
-                                identifier:identifier
-                               silenceable:YES];
-    switch (selection) {
-        case kiTermWarningSelection0:
-            return YES;
-            
-        case kiTermWarningSelection1:
-            if ([identifier isEqualToString:[iTermAdvancedSettingsModel noSyncDoNotWarnBeforeMultilinePasteUserDefaultsKey]]) {
-                // cancel
-                return NO;
-            } else {
-                // Paste without newline
-                pasteEvent.string =
-                    [pasteEvent.string stringByTrimmingTrailingCharactersFromCharacterSet:[NSCharacterSet newlineCharacterSet]];
-                return YES;
-            }
-            
-        case kiTermWarningSelection2:
-            // cancel
-            return NO;
-            
-        case kItermWarningSelectionError:
-            ELog(@"Unexpected error from warning");
-            return YES;
+
+    if (!prompt) {
+        return YES;
     }
+    // Issue 5115
+    [iTermWarning unsilenceIdentifier:identifier ifSelectionEquals:[actions indexOfObjectIdenticalTo:cancel]];
     
-    ELog(@"Unhandled selection %@", @(selection));
-    return YES;
+    iTermWarning *warning = [[[iTermWarning alloc] init] autorelease];
+    warning.title = theTitle;
+    warning.warningActions = actions;
+    warning.identifier = identifier;
+    warning.warningType = kiTermWarningTypePermanentlySilenceable;
+    warning.cancelLabel = @"Cancel";
+    [warning runModal];
+    return result;
 }
 
 - (int)numberOfSpacesToConvertTabsTo:(NSString *)source {

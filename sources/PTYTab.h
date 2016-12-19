@@ -50,7 +50,6 @@
 
 // Size we should report to fit the current layout
 @property(nonatomic, readonly) NSSize tmuxSize;
-@property(nonatomic, readonly) NSSize maxTmuxSize;
 @property(nonatomic, copy) NSString *tmuxWindowName;
 @property (readonly, getter=isTmuxTab) BOOL tmuxTab;
 
@@ -164,7 +163,7 @@
 - (void)notifyWindowChanged;
 - (void)maximize;
 // Does any session in this tab require prompt on close?
-- (BOOL)promptOnClose;
+- (iTermPromptOnCloseReason *)promptOnCloseReason;
 
 // Anyone changing the number of sessions must call this after the sessions
 // are "well formed".

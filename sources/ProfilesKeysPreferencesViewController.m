@@ -8,8 +8,11 @@
 
 #import "ProfilesKeysPreferencesViewController.h"
 #import "ITAddressBookMgr.h"
+#import "iTermHotKeyController.h"
+#import "iTermHotkeyPreferencesWindowController.h"
 #import "iTermKeyBindingMgr.h"
 #import "iTermKeyMappingViewController.h"
+#import "iTermSizeRememberingView.h"
 #import "iTermShortcutInputView.h"
 #import "iTermWarning.h"
 #import "PreferencePanel.h"
@@ -24,6 +27,10 @@ static NSString *const kDeleteKeyString = @"0x7f-0x0";
     IBOutlet NSMatrix *_rightOptionKeySends;
     IBOutlet NSButton *_deleteSendsCtrlHButton;
     IBOutlet NSButton *_applicationKeypadAllowed;
+    IBOutlet NSButton *_hasHotkey;
+    IBOutlet NSButton *_configureHotKey;
+    IBOutlet NSView *_hotKeyContainerView;
+    IBOutlet iTermKeyMappingViewController *_keyMappingViewController;
 }
 
 - (void)dealloc {
@@ -52,11 +59,36 @@ static NSString *const kDeleteKeyString = @"0x7f-0x0";
                     key:KEY_APPLICATION_KEYPAD_ALLOWED
                    type:kPreferenceInfoTypeCheckbox];
 
+    PreferenceInfo *info = [self defineControl:_hasHotkey
+                                           key:KEY_HAS_HOTKEY
+                                          type:kPreferenceInfoTypeCheckbox];
+    info.customSettingChangedHandler = ^(id sender) {
+        if ([[self stringForKey:KEY_HOTKEY_CHARACTERS_IGNORING_MODIFIERS] length]) {
+            [self setBool:([sender state] == NSOnState) forKey:KEY_HAS_HOTKEY];
+        } else {
+            [self openHotKeyPanel:nil];
+        }
+    };
+    info.observer = ^() {
+        _configureHotKey.enabled = _hasHotkey.state == NSOnState;
+    };
+    
     [self updateDeleteSendsCtrlH];
+    [_keyMappingViewController hideAddTouchBarItem];
+}
+
+- (void)layoutSubviewsForEditCurrentSessionMode {
+    _hotKeyContainerView.hidden = YES;
+
+    // Update the "original" size of the view.
+    iTermSizeRememberingView *sizeRememberingView = (iTermSizeRememberingView *)self.view;
+    CGSize size = sizeRememberingView.originalSize;
+    size.height -= _hotKeyContainerView.frame.size.height;
+    sizeRememberingView.originalSize = size;
 }
 
 - (NSArray *)keysForBulkCopy {
-    NSArray *keys = @[ KEY_KEYBOARD_MAP ];
+    NSArray *keys = @[ KEY_KEYBOARD_MAP, KEY_TOUCHBAR_MAP, KEY_OPTION_KEY_SENDS, KEY_RIGHT_OPTION_KEY_SENDS, KEY_APPLICATION_KEYPAD_ALLOWED ];
     return [[super keysForBulkCopy] arrayByAddingObjectsFromArray:keys];
 }
 
@@ -64,6 +96,37 @@ static NSString *const kDeleteKeyString = @"0x7f-0x0";
     [super reloadProfile];
     [[NSNotificationCenter defaultCenter] postNotificationName:kKeyBindingsChangedNotification
                                                         object:nil];
+}
+
+#pragma mark - Actions
+
+- (IBAction)openHotKeyPanel:(id)sender {
+    iTermHotkeyPreferencesModel *model = [[[iTermHotkeyPreferencesModel alloc] init] autorelease];
+    model.hasModifierActivation = [self boolForKey:KEY_HOTKEY_ACTIVATE_WITH_MODIFIER];
+    model.modifierActivation = [self unsignedIntegerForKey:KEY_HOTKEY_MODIFIER_ACTIVATION];
+    model.primaryShortcut = [[[iTermShortcut alloc] initWithKeyCode:[self unsignedIntegerForKey:KEY_HOTKEY_KEY_CODE]
+                                                          modifiers:[self unsignedIntegerForKey:KEY_HOTKEY_MODIFIER_FLAGS]
+                                                         characters:[self stringForKey:KEY_HOTKEY_CHARACTERS]
+                                        charactersIgnoringModifiers:[self stringForKey:KEY_HOTKEY_CHARACTERS_IGNORING_MODIFIERS]] autorelease];
+    model.autoHide = [self boolForKey:KEY_HOTKEY_AUTOHIDE];
+    model.showAutoHiddenWindowOnAppActivation = [self boolForKey:KEY_HOTKEY_REOPEN_ON_ACTIVATION];
+    model.animate = [self boolForKey:KEY_HOTKEY_ANIMATE];
+    model.floats = [self boolForKey:KEY_HOTKEY_FLOAT];
+    model.dockPreference = [self intForKey:KEY_HOTKEY_DOCK_CLICK_ACTION];
+    [model setAlternateShortcutDictionaries:(id)[self objectForKey:KEY_HOTKEY_ALTERNATE_SHORTCUTS]];
+    
+    iTermHotkeyPreferencesWindowController *panel = [[iTermHotkeyPreferencesWindowController alloc] init];
+    panel.descriptorsInUseByOtherProfiles =
+        [[iTermHotKeyController sharedInstance] descriptorsForProfileHotKeysExcept:self.delegate.profilePreferencesCurrentProfile];
+    panel.model = model;
+    
+    [self.view.window beginSheet:panel.window completionHandler:^(NSModalResponse returnCode) {
+        if (returnCode == NSModalResponseOK) {
+            [self setObjectsFromDictionary:model.dictionaryValue];
+            _hasHotkey.state = [self boolForKey:KEY_HAS_HOTKEY] ? NSOnState : NSOffState;
+        }
+        _configureHotKey.enabled = [self boolForKey:KEY_HAS_HOTKEY];
+    }];
 }
 
 #pragma mark - Notifications
@@ -151,28 +214,50 @@ static NSString *const kDeleteKeyString = @"0x7f-0x0";
     return [iTermKeyBindingMgr sortedKeyCombinationsForProfile:profile];
 }
 
+- (NSArray *)keyMappingSortedTouchBarKeys:(iTermKeyMappingViewController *)viewController {
+    Profile *profile = [self.delegate profilePreferencesCurrentProfile];
+    if (!profile) {
+        return nil;
+    }
+    return [iTermKeyBindingMgr sortedTouchBarItemsForProfile:profile];
+}
+
+- (NSDictionary *)keyMappingTouchBarItems {
+    Profile *profile = [self.delegate profilePreferencesCurrentProfile];
+    if (!profile) {
+        return nil;
+    }
+    return [iTermKeyBindingMgr touchBarItemsForProfile:profile];
+}
+
 - (void)keyMapping:(iTermKeyMappingViewController *)viewController
- didChangeKeyCombo:(NSString *)keyCombo
+      didChangeKey:(NSString *)keyCombo
+    isTouchBarItem:(BOOL)isTouchBarItem
            atIndex:(NSInteger)index
           toAction:(int)action
          parameter:(NSString *)parameter
+             label:(NSString *)label
         isAddition:(BOOL)addition {
     Profile *profile = [self.delegate profilePreferencesCurrentProfile];
     assert(profile);
     NSMutableDictionary *dict = [[profile mutableCopy] autorelease];
-    
-    if ([iTermKeyBindingMgr haveGlobalKeyMappingForKeyString:keyCombo]) {
-        if (![self warnAboutOverride]) {
-            return;
+
+    if (isTouchBarItem) {
+        [iTermKeyBindingMgr setTouchBarItemWithKey:keyCombo toAction:action value:parameter label:label inProfile:dict];
+    } else {
+        if ([iTermKeyBindingMgr haveGlobalKeyMappingForKeyString:keyCombo]) {
+            if (![self warnAboutOverride]) {
+                return;
+            }
         }
+        
+        [iTermKeyBindingMgr setMappingAtIndex:index
+                                       forKey:keyCombo
+                                       action:action
+                                        value:parameter
+                                    createNew:addition
+                                   inBookmark:dict];
     }
-    
-    [iTermKeyBindingMgr setMappingAtIndex:index
-                                   forKey:keyCombo
-                                   action:action
-                                    value:parameter
-                                createNew:addition
-                               inBookmark:dict];
     [[self.delegate profilePreferencesCurrentModel] setBookmark:dict withGuid:profile[KEY_GUID]];
     [[self.delegate profilePreferencesCurrentModel] flush];
     [[NSNotificationCenter defaultCenter] postNotificationName:kReloadAllProfiles object:nil];
@@ -180,25 +265,29 @@ static NSString *const kDeleteKeyString = @"0x7f-0x0";
                                                         object:nil];
 }
 
-
 - (void)keyMapping:(iTermKeyMappingViewController *)viewController
-    removeKeyCombo:(NSString *)keyCombo {
-    
+         removeKey:(NSString *)keyCombo
+    isTouchBarItem:(BOOL)isTouchBarItem {
     Profile *profile = [self.delegate profilePreferencesCurrentProfile];
     assert(profile);
     
     NSMutableDictionary *dict = [[profile mutableCopy] autorelease];
-    NSUInteger index =
-        [[iTermKeyBindingMgr sortedKeyCombinationsForProfile:profile] indexOfObject:keyCombo];
-    assert(index != NSNotFound);
-    
-    [iTermKeyBindingMgr removeMappingAtIndex:index inBookmark:dict];
+    if (isTouchBarItem) {
+        [iTermKeyBindingMgr removeTouchBarItemWithKey:keyCombo inMutableProfile:dict];
+    } else {
+        NSUInteger index =
+            [[iTermKeyBindingMgr sortedKeyCombinationsForProfile:profile] indexOfObject:keyCombo];
+        assert(index != NSNotFound);
+        
+        [iTermKeyBindingMgr removeMappingAtIndex:index inBookmark:dict];
+    }
     [[self.delegate profilePreferencesCurrentModel] setBookmark:dict withGuid:profile[KEY_GUID]];
     [[self.delegate profilePreferencesCurrentModel] flush];
     [[NSNotificationCenter defaultCenter] postNotificationName:kReloadAllProfiles object:nil];
     [[NSNotificationCenter defaultCenter] postNotificationName:kKeyBindingsChangedNotification
                                                         object:nil];
 }
+
 
 - (NSArray *)keyMappingPresetNames:(iTermKeyMappingViewController *)viewController {
     return [iTermKeyBindingMgr presetKeyMappingsNames];

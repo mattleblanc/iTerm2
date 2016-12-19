@@ -10,6 +10,7 @@
 #import "iTermColorMap.h"
 #import "iTermExpose.h"
 #import "iTermGrowlDelegate.h"
+#import "iTermImage.h"
 #import "iTermImageMark.h"
 #import "iTermPreferences.h"
 #import "iTermSelection.h"
@@ -32,7 +33,6 @@
 #import "VT100Token.h"
 
 #import <apr-1/apr_base64.h>
-#include <string.h>
 
 NSString *const kScreenStateKey = @"Screen State";
 
@@ -860,9 +860,39 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
 }
 
 - (void)clearBuffer {
+    // Cancel out the current command if shell integration is in use and we are
+    // at the shell prompt.
+
+    // NOTE: This is in screen coords (y=0 is the top)
+    VT100GridCoord newCommandStart = VT100GridCoordMake(-1, -1);
+    if (commandStartX_ >= 0) {
+        // Save the start location of the command. If it's a multi-line command
+        // it'll get truncated and the display is hopelessly messed up, so
+        // while this is not the true start of the command it's better than not
+        // recording a start, which would break alt-click to move the cursor.
+        // The user will probably cancel the command or press ^L to redrasw.
+        newCommandStart = VT100GridCoordMake(commandStartX_, 0);
+
+        // Abort the current command.
+        [self commandWasAborted];
+    }
+    // There is no last command after clearing the screen, so reset it.
+    _lastCommandOutputRange = VT100GridAbsCoordRangeMake(-1, -1, -1, -1);
+
+    // Clear the grid by scrolling it up into history.
     [self clearAndResetScreenPreservingCursorLine];
+
+    // Erase history.
     [self clearScrollbackBuffer];
+
+    // Redraw soon.
     [delegate_ screenUpdateDisplay:NO];
+
+    if (newCommandStart.x >= 0) {
+        // Create a new mark and inform the delegate that there's new command start coord.
+        [delegate_ screenPromptDidStartAtLine:[self numberOfScrollbackLines] + self.cursorY - 1];
+        [self commandDidStartAtCoord:newCommandStart];
+    }
 }
 
 // This clears the screen, leaving the cursor's line at the top and preserves the cursor's x
@@ -1012,7 +1042,8 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
                         [delegate_ screenShouldTreatAmbiguousCharsAsDoubleWidth],
                         NULL,
                         &dwc,
-                        _useHFSPlusMapping);
+                        _useHFSPlusMapping,
+                        [delegate_ screenUnicodeVersion]);
     ssize_t bufferOffset = 0;
     if (augmented && len > 0) {
         screen_char_t *theLine = [self getLineAtScreenIndex:pred.y];
@@ -1093,7 +1124,7 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
                                        // more cooperation between VT100Screen and PTYTextView than is currently in place because
                                        // the selection could become truncated, and regardless, will need to move up a line in terms
                                        // of absolute Y position (normally when the screen scrolls the absolute Y position of the
-                                       // selection stays the same and the viewport moves down, or else there is soem scrollback
+                                       // selection stays the same and the viewport moves down, or else there is some scrollback
                                        // overflow and PTYTextView -refresh bumps the selection's Y position, but because in this
                                        // case we don't append to the line buffer, scrollback overflow will not increment).
                                        [delegate_ screenRemoveSelection];
@@ -1269,12 +1300,7 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
     NSNumber *altSavedY = [state objectForKey:kStateDictAltSavedCY];
     if (altSavedX && altSavedY && inAltScreen) {
         primaryGrid_.cursor = VT100GridCoordMake([altSavedX intValue], [altSavedY intValue]);
-    }
-
-    NSNumber *savedX = [state objectForKey:kStateDictSavedCX];
-    NSNumber *savedY = [state objectForKey:kStateDictSavedCY];
-    if (savedX && savedY) {
-        [terminal_ setSavedCursorPosition:VT100GridCoordMake([savedX intValue], [savedY intValue])];
+        [terminal_ setSavedCursorPosition:primaryGrid_.cursor];
     }
 
     currentGrid_.cursorX = [[state objectForKey:kStateDictCursorX] intValue];
@@ -1411,6 +1437,11 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
 
 - (void)setCursorPosition:(VT100GridCoord)coord {
     currentGrid_.cursor = coord;
+}
+
+- (void)resetTimestamps {
+    [primaryGrid_ resetTimestamps];
+    [altGrid_ resetTimestamps];
 }
 
 // Like getLineAtIndex:withBuffer:, but uses dedicated storage for the result.
@@ -2387,10 +2418,16 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
     }
     if (allNulls) {
         int i;
+        screen_char_t filler;
+        InitializeScreenChar(&filler, [terminal_ foregroundColorCode], [terminal_ backgroundColorCode]);
+        filler.code = TAB_FILLER;
         for (i = currentGrid_.cursorX; i < nextTabStop - 1; i++) {
-            aLine[i].code = TAB_FILLER;
+            aLine[i] = filler;
         }
-        aLine[i].code = '\t';
+
+        screen_char_t tab = filler;
+        tab.code = '\t';
+        aLine[i] = tab;
     }
     currentGrid_.cursorX = nextTabStop;
 }
@@ -2508,7 +2545,7 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
     } else {
         lineBuffer = linebuffer_;
     }
-    const int n = [currentGrid_ numberOfNonEmptyLines];
+    const int n = [currentGrid_ numberOfNonEmptyLinesIncludingWhitespaceAsEmpty:YES];
     for (int i = 0; i < n; i++) {
         [self incrementOverflowBy:
             [currentGrid_ scrollWholeScreenUpIntoLineBuffer:lineBuffer
@@ -3331,10 +3368,17 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
                               units:(VT100TerminalUnits)heightUnits
                 preserveAspectRatio:(BOOL)preserveAspectRatio
                               inset:(NSEdgeInsets)inset
-                              image:(NSImage *)image
+                              image:(NSImage *)nativeImage
                                data:(NSData *)data {
+    iTermImage *image;
+    if (nativeImage) {
+        image = [iTermImage imageWithNativeImage:nativeImage];
+    } else {
+        image = [iTermImage imageWithCompressedData:data];
+    }
     if (!image) {
-        image = [NSImage imageNamed:@"broken_image"];
+        image = [iTermImage imageWithNativeImage:[NSImage imageNamed:@"broken_image"]];
+        assert(image);
     }
 
     BOOL needsWidth = NO;
@@ -3450,7 +3494,6 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
     if (inlineFileInfo_) {
         // TODO: Handle objects other than images.
         NSData *data = [NSData dataWithBase64EncodedString:inlineFileInfo_[kInlineFileBase64String]];
-        NSImage *image = [[[NSImage alloc] initWithData:data] autorelease];
         [self appendImageAtCursorWithName:inlineFileInfo_[kInlineFileName]
                                     width:[inlineFileInfo_[kInlineFileWidth] intValue]
                                     units:(VT100TerminalUnits)[inlineFileInfo_[kInlineFileWidthUnits] intValue]
@@ -3458,7 +3501,7 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
                                     units:(VT100TerminalUnits)[inlineFileInfo_[kInlineFileHeightUnits] intValue]
                       preserveAspectRatio:[inlineFileInfo_[kInlineFilePreserveAspectRatio] boolValue]
                                     inset:[inlineFileInfo_[kInilineFileInset] futureEdgeInsetsValue]
-                                    image:image
+                                    image:nil
                                      data:data];
         [inlineFileInfo_ release];
         inlineFileInfo_ = nil;
@@ -3613,8 +3656,12 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
 
 - (void)terminalCommandDidStart {
     DLog(@"FinalTerm: terminalCommandDidStart");
-    commandStartX_ = currentGrid_.cursorX;
-    commandStartY_ = currentGrid_.cursorY + [self numberOfScrollbackLines] + [self totalScrollbackOverflow];
+    [self commandDidStartAtCoord:currentGrid_.cursor];
+}
+
+- (void)commandDidStartAtCoord:(VT100GridCoord)coord {
+    commandStartX_ = coord.x;
+    commandStartY_ = coord.y + [self numberOfScrollbackLines] + [self totalScrollbackOverflow];
     [delegate_ screenCommandDidChangeWithRange:[self commandRange]];
 }
 
@@ -3632,6 +3679,10 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
 
 - (void)terminalAbortCommand {
     DLog(@"FinalTerm: terminalAbortCommand");
+    [self commandWasAborted];
+}
+
+- (void)commandWasAborted {
     VT100ScreenMark *screenMark = [self lastCommandMark];
     if (screenMark) {
         DLog(@"Removing last command mark %@", screenMark);
@@ -3801,6 +3852,124 @@ static NSString *const kInilineFileInset = @"inset";  // NSValue of NSEdgeInsets
     return [delegate_ screenCellSize];
 }
 
+- (void)terminalSetUnicodeVersion:(NSInteger)unicodeVersion {
+    [delegate_ screenSetUnicodeVersion:unicodeVersion];
+}
+
+- (NSInteger)terminalUnicodeVersion {
+    return [delegate_ screenUnicodeVersion];
+}
+
+// fg=ff0080,bg=srgb:808080
+- (void)terminalSetColorNamed:(NSString *)name to:(NSString *)colorString {
+    if ([name isEqualToString:@"preset"]) {
+        [delegate_ screenSelectColorPresetNamed:colorString];
+        return;
+    }
+    if ([colorString isEqualToString:@"default"] && [name isEqualToString:@"tab"]) {
+        [delegate_ screenSetCurrentTabColor:nil];
+        return;
+    }
+
+    NSInteger colon = [colorString rangeOfString:@":"].location;
+    NSString *cs;
+    NSString *hex;
+    if (colon != NSNotFound && colon + 1 != colorString.length && colon != 0) {
+        cs = [colorString substringToIndex:colon];
+        hex = [colorString substringFromIndex:colon + 1];
+    } else {
+        cs = @"srgb";
+        hex = colorString;
+    }
+    NSDictionary *colorSpaces = @{ @"srgb": @"sRGBColorSpace",
+                                   @"rgb": @"genericRGBColorSpace",
+                                   @"p3": @"displayP3ColorSpace" };
+    NSColorSpace *colorSpace = [NSColorSpace sRGBColorSpace];
+    if (colorSpaces[cs]) {
+        SEL selector = NSSelectorFromString(colorSpaces[cs]);
+        if ([NSColorSpace respondsToSelector:selector]) {
+            colorSpace = [[NSColorSpace class] performSelector:selector];
+            if (!colorSpace) {
+                colorSpace = [NSColorSpace sRGBColorSpace];
+            }
+        }
+    }
+    if (!colorSpace) {
+        return;
+    }
+
+    CGFloat r, g, b;
+    if (hex.length == 6) {
+        NSScanner *scanner = [NSScanner scannerWithString:hex];
+        unsigned int rgb = 0;
+        if (![scanner scanHexInt:&rgb]) {
+            return;
+        }
+        r = ((rgb >> 16) & 0xff);
+        g = ((rgb >> 8) & 0xff);
+        b = ((rgb >> 0) & 0xff);
+    } else if (hex.length == 3) {
+        NSScanner *scanner = [NSScanner scannerWithString:hex];
+        unsigned int rgb = 0;
+        if (![scanner scanHexInt:&rgb]) {
+            return;
+        }
+        r = ((rgb >> 8) & 0xf) | ((rgb >> 4) & 0xf0);
+        g = ((rgb >> 4) & 0xf) | ((rgb >> 0) & 0xf0);
+        b = ((rgb >> 0) & 0xf) | ((rgb << 4) & 0xf0);
+    } else {
+        return;
+    }
+    CGFloat components[4] = { r / 255.0, g / 255.0, b / 255.0, 1.0 };
+    NSColor *color = [NSColor colorWithColorSpace:colorSpace
+                                       components:components
+                                            count:sizeof(components) / sizeof(*components)];
+    if (!color) {
+        return;
+    }
+
+    if ([name isEqualToString:@"tab"]) {
+        [delegate_ screenSetCurrentTabColor:color];
+        return;
+    }
+
+    NSDictionary *names = @{ @"fg": @(kColorMapForeground),
+                             @"bg": @(kColorMapBackground),
+                             @"bold": @(kColorMapBold),
+                             @"link": @(kColorMapLink),
+                             @"selbg": @(kColorMapSelection),
+                             @"selfg": @(kColorMapSelectedText),
+                             @"curbg": @(kColorMapCursor),
+                             @"curfg": @(kColorMapCursorText),
+                             @"underline": @(kColorMapUnderline),
+
+                             @"black": @(kColorMapAnsiBlack),
+                             @"red": @(kColorMapAnsiRed),
+                             @"green": @(kColorMapAnsiGreen),
+                             @"yellow": @(kColorMapAnsiYellow),
+                             @"blue": @(kColorMapAnsiBlue),
+                             @"magenta": @(kColorMapAnsiMagenta),
+                             @"cyan": @(kColorMapAnsiCyan),
+                             @"white": @(kColorMapAnsiWhite),
+
+                             @"br_black": @(kColorMapAnsiBlack + kColorMapAnsiBrightModifier),
+                             @"br_red": @(kColorMapAnsiRed + kColorMapAnsiBrightModifier),
+                             @"br_green": @(kColorMapAnsiGreen + kColorMapAnsiBrightModifier),
+                             @"br_yellow": @(kColorMapAnsiYellow + kColorMapAnsiBrightModifier),
+                             @"br_blue": @(kColorMapAnsiBlue + kColorMapAnsiBrightModifier),
+                             @"br_magenta": @(kColorMapAnsiMagenta + kColorMapAnsiBrightModifier),
+                             @"br_cyan": @(kColorMapAnsiCyan + kColorMapAnsiBrightModifier),
+                             @"br_white": @(kColorMapAnsiWhite + kColorMapAnsiBrightModifier) };
+
+    NSNumber *keyNumber = names[name];
+    if (!keyNumber) {
+        return;
+    }
+    NSInteger key = [keyNumber integerValue];
+    
+    [delegate_ screenSetColor:color forKey:key];
+}
+
 #pragma mark - Private
 
 - (VT100GridCoordRange)commandRange {
@@ -3964,16 +4133,15 @@ static void SwapInt(int *a, int *b) {
     return result;
 }
 
-- (void)trimSelectionFromStart:(VT100GridCoord)start
+- (BOOL)trimSelectionFromStart:(VT100GridCoord)start
                            end:(VT100GridCoord)end
                       toStartX:(VT100GridCoord *)startPtr
-                        toEndX:(VT100GridCoord *)endPtr
-{
+                        toEndX:(VT100GridCoord *)endPtr {
     if (start.x < 0 || end.x < 0 ||
         start.y < 0 || end.y < 0) {
         *startPtr = start;
         *endPtr = end;
-        return;
+        return YES;
     }
 
     if (!XYIsBeforeXY(start.x, start.y, end.x, end.y)) {
@@ -3999,13 +4167,22 @@ static void SwapInt(int *a, int *b) {
     VT100GridRun run = VT100GridRunFromCoords(VT100GridCoordMake(startX, startY),
                                               VT100GridCoordMake(endX, endY),
                                               currentGrid_.size.width);
-    assert(run.length >= 0);
+    if (run.length == 0) {
+        DLog(@"Run has length 0 given start and end of %@ and %@", VT100GridCoordDescription(start),
+             VT100GridCoordDescription(end));
+        return NO;
+    }
     run = [self runByTrimmingNullsFromRun:run];
-    assert(run.length >= 0);
+    if (run.length == 0) {
+        DLog(@"After trimming, run has length 0 given start and end of %@ and %@", VT100GridCoordDescription(start),
+             VT100GridCoordDescription(end));
+        return NO;
+    }
     VT100GridCoord max = VT100GridRunMax(run, currentGrid_.size.width);
 
     *startPtr = run.origin;
     *endPtr = max;
+    return YES;
 }
 
 - (LineBufferPositionRange *)positionRangeForCoordRange:(VT100GridCoordRange)range
@@ -4044,10 +4221,13 @@ static void SwapInt(int *a, int *b) {
 
     VT100GridCoord trimmedStart;
     VT100GridCoord trimmedEnd;
-    [self trimSelectionFromStart:VT100GridCoordMake(range.start.x, range.start.y)
-                             end:VT100GridCoordMake(range.end.x, range.end.y)
-                        toStartX:&trimmedStart
-                          toEndX:&trimmedEnd];
+    BOOL ok = [self trimSelectionFromStart:VT100GridCoordMake(range.start.x, range.start.y)
+                                       end:VT100GridCoordMake(range.end.x, range.end.y)
+                                  toStartX:&trimmedStart
+                                    toEndX:&trimmedEnd];
+    if (!ok) {
+        return nil;
+    }
     if (VT100GridCoordOrder(trimmedStart, trimmedEnd) == NSOrderedDescending) {
         if (tolerateEmpty) {
             trimmedStart = trimmedEnd = range.start;
@@ -4199,10 +4379,10 @@ static void SwapInt(int *a, int *b) {
     collectInputForPrinting_ = NO;
 }
 
-- (BOOL)isDoubleWidthCharacter:(unichar)c
-{
+- (BOOL)isDoubleWidthCharacter:(unichar)c {
     return [NSString isDoubleWidthCharacter:c
-                     ambiguousIsDoubleWidth:[delegate_ screenShouldTreatAmbiguousCharsAsDoubleWidth]];
+                     ambiguousIsDoubleWidth:[delegate_ screenShouldTreatAmbiguousCharsAsDoubleWidth]
+                             unicodeVersion:[delegate_ screenUnicodeVersion]];
 }
 
 - (void)popScrollbackLines:(int)linesPushed
@@ -4471,7 +4651,7 @@ static void SwapInt(int *a, int *b) {
            kScreenStateShellIntegrationInstalledKey: @(_shellIntegrationInstalled),
            kScreenStateLastCommandMarkKey: _lastCommandMark.guid ?: [NSNull null],
            kScreenStatePrimaryGridStateKey: primaryGrid_.dictionaryValue ?: @{},
-           kScreenStateAlternateGridStateKey: primaryGrid_.dictionaryValue ?: [NSNull null],
+           kScreenStateAlternateGridStateKey: altGrid_.dictionaryValue ?: [NSNull null],
            kScreenStateNumberOfLinesDroppedKey: @(linesDroppedForBrevity)
            };
     return [dict dictionaryByRemovingNullValues];
@@ -4509,8 +4689,8 @@ static void SwapInt(int *a, int *b) {
     }
 
     LineBuffer *lineBuffer = [[LineBuffer alloc] initWithDictionary:dictionary];
-    if (includeRestorationBanner) {
-        [lineBuffer appendMessage:@"Session Restored"];
+    if (includeRestorationBanner && [iTermAdvancedSettingsModel showSessionRestoredBanner]) {
+        [lineBuffer appendMessage:@"Session Contents Restored"];
     }
     [lineBuffer setMaxLines:maxScrollbackLines_];
     if (!unlimitedScrollback_) {

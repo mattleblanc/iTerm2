@@ -1,4 +1,3 @@
-// -*- mode:objc -*-
 /*
  **  ScreenChar.h
  **
@@ -33,6 +32,7 @@
 #import "NSStringITerm.h"
 #import "VT100GridTypes.h"
 
+@class iTermImage;
 @class iTermImageInfo;
 
 // This is used in the rightmost column when a double-width character would
@@ -195,6 +195,23 @@ static inline NSString* ReplacementString()
 {
     const unichar kReplacementCharacter = UNICODE_REPLACEMENT_CHAR;
     return [NSString stringWithCharacters:&kReplacementCharacter length:1];
+}
+
+static inline BOOL ScreenCharacterAttributesEqual(screen_char_t *c1, screen_char_t *c2) {
+    return (c1->foregroundColor == c2->foregroundColor &&
+            c1->fgGreen == c2->fgGreen &&
+            c1->fgBlue == c2->fgBlue &&
+            c1->backgroundColor == c2->backgroundColor &&
+            c1->bgGreen == c2->bgGreen &&
+            c1->bgBlue == c2->bgBlue &&
+            c1->foregroundColorMode == c2->foregroundColorMode &&
+            c1->backgroundColorMode == c2->backgroundColorMode &&
+            c1->bold == c2->bold &&
+            c1->faint == c2->faint &&
+            c1->italic == c2->italic &&
+            c1->blink == c2->blink &&
+            c1->underline == c2->underline &&
+            c1->image == c2->image);
 }
 
 // Copy foreground color from one char to another.
@@ -381,7 +398,8 @@ void StringToScreenChars(NSString *s,
                          BOOL ambiguousIsDoubleWidth,
                          int *cursorIndex,
                          BOOL *foundDwc,
-                         BOOL useHFSPlusMapping);
+                         BOOL useHFSPlusMapping,
+                         NSInteger unicodeVersion);
 
 // Copy attributes from fg and bg, and zero out other fields. Text attributes like bold, italic, etc.
 // come from fg.
@@ -411,7 +429,7 @@ void SetPositionInImageChar(screen_char_t *charPtr, int x, int y);
 
 // Assigns an image to a code allocated by ImageCharForNewImage. data is optional and only used for
 // animated gifs.
-void SetDecodedImage(unichar code, NSImage *image, NSData *data);
+void SetDecodedImage(unichar code, iTermImage *image, NSData *data);
 
 // Releases all memory associated with an image. The code comes from ImageCharForNewImage.
 void ReleaseImage(unichar code);

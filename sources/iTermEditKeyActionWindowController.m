@@ -12,6 +12,7 @@
 #import "iTermShortcutInputView.h"
 #import "iTermKeyBindingMgr.h"
 #import "NSPopUpButton+iTerm.h"
+#import "RegexKitLite.h"
 
 @interface iTermEditKeyActionWindowController () <iTermShortcutInputViewDelegate>
 
@@ -21,6 +22,8 @@
 
 @implementation iTermEditKeyActionWindowController {
     IBOutlet iTermShortcutInputView *_shortcutField;
+    IBOutlet NSTextField *_keyboardShortcutLabel;
+    IBOutlet NSTextField *_touchBarLabel;
     IBOutlet NSPopUpButton *_actionPopup;
     IBOutlet NSTextField *_parameter;
     IBOutlet NSTextField *_parameterLabel;
@@ -41,6 +44,7 @@
 
 - (void)dealloc {
     [_pasteSpecialViewController release];
+    [_touchBarItemID release];
     [super dealloc];
 }
 
@@ -58,6 +62,7 @@
         formattedString = [iTermKeyBindingMgr formatKeyCombination:self.currentKeyCombination];
     }
     _shortcutField.stringValue = formattedString;
+    _touchBarLabel.stringValue = self.label ?: @"";
     [_actionPopup selectItemWithTag:self.action];
     [_actionPopup setTitle:[self titleOfActionWithTag:self.action]];
     _parameter.stringValue = self.parameterValue ?: @"";
@@ -121,35 +126,26 @@
 
 #pragma mark - iTermShortcutInputViewDelegate
 
-// Note: This is called directly by HotkeyWindowController when the action requires key remapping
+// Note: This is called directly by iTermHotKeyController when the action requires key remapping
 // to be disabled so the shortcut can be input properly. In this case, |view| will be nil.
 - (void)shortcutInputView:(iTermShortcutInputView *)view didReceiveKeyPressEvent:(NSEvent *)event {
-    unsigned int keyMods;
-    unsigned short keyCode;
-    NSString *unmodkeystr;
-
-    keyMods = [event modifierFlags];
-    unmodkeystr = [event charactersIgnoringModifiers];
-    keyCode = [unmodkeystr length] > 0 ? [unmodkeystr characterAtIndex:0] : 0;
-
-    // turn off all the other modifier bits we don't care about
-    unsigned int theModifiers = (keyMods &
-                                 (NSAlternateKeyMask | NSControlKeyMask | NSShiftKeyMask |
-                                  NSCommandKeyMask | NSNumericPadKeyMask));
-
-    // On some keyboards, arrow keys have NSNumericPadKeyMask bit set; manually set it for keyboards that don't
-    if (keyCode >= NSUpArrowFunctionKey && keyCode <= NSRightArrowFunctionKey) {
-        theModifiers |= NSNumericPadKeyMask;
-    }
-    self.currentKeyCombination = [NSString stringWithFormat:@"0x%x-0x%x", keyCode, theModifiers];
-
-    [_shortcutField setStringValue:[iTermKeyBindingMgr formatKeyCombination:self.currentKeyCombination]];
+    self.currentKeyCombination = view.shortcut.identifier;
 }
 
 #pragma mark - Private
 
 - (void)updateViewsAnimated:(BOOL)animated {
     int tag = [[_actionPopup selectedItem] tag];
+    if (self.isTouchBarItem) {
+        _keyboardShortcutLabel.stringValue = @"Touch Bar Label";
+        _touchBarLabel.hidden = NO;
+        _shortcutField.hidden = YES;
+    } else {
+        _keyboardShortcutLabel.stringValue = @"Keyboard Shortcut";
+        _touchBarLabel.hidden = YES;
+        _shortcutField.hidden = NO;
+    }
+    
     switch (tag) {
         case KEY_ACTION_HEX_CODE:
             [_parameter setHidden:NO];
@@ -416,6 +412,14 @@
     }
 }
 
++ (BOOL)item:(NSMenuItem *)item isWindowInWindowsMenu:(NSMenu *)menu {
+    if (![[menu title] isEqualToString:@"Window"]) {
+        return NO;
+    }
+    
+    return ([item.title isMatchedByRegex:@"^\\d+\\. " ]);
+}
+
 + (void)recursiveAddMenu:(NSMenu *)menu
             toButtonMenu:(NSMenu *)buttonMenu
                    depth:(int)depth{
@@ -424,7 +428,7 @@
             continue;
         }
         if ([[item title] isEqualToString:@"Services"] ||  // exclude services menu
-            isnumber([[item title] characterAtIndex:0])) {  // exclude windows in window menu
+            [self item:item isWindowInWindowsMenu:menu]) {  // exclude windows in window menu
             continue;
         }
         NSMenuItem *theItem = [[[NSMenuItem alloc] init] autorelease];
@@ -458,9 +462,17 @@
 
 
 - (IBAction)ok:(id)sender {
-    if (_shortcutField.stringValue.length == 0) {
-        NSBeep();
-        return;
+    if (self.isTouchBarItem) {
+        if (!_touchBarLabel.stringValue.length) {
+            NSBeep();
+            return;
+        }
+        self.label = _touchBarLabel.stringValue;
+    } else {
+        if (!self.currentKeyCombination) {
+            NSBeep();
+            return;
+        }
     }
     
     self.action = [[_actionPopup selectedItem] tag];
